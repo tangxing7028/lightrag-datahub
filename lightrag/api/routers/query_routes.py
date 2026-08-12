@@ -7,9 +7,11 @@ import json
 import time
 from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends
+from lightrag import LightRAG
 from lightrag.base import QueryParam
 from lightrag.api.input_limits import count_conversation_input_chars
 from lightrag.api.utils_api import get_combined_auth_dependency, internal_server_error
+from lightrag.api.workspace_manager import make_rag_dependency
 from lightrag.constants import (
     MAX_KEYWORD_CHARS,
     MAX_KEYWORDS_PER_LIST,
@@ -332,6 +334,11 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
     combined_auth = get_combined_auth_dependency(api_key)
 
+    # Per-request instance resolution: the LIGHTRAG-WORKSPACE header selects
+    # the LightRAG instance via app.state.rag_manager; without a manager the
+    # factory-provided default instance is used (see workspace_manager.py).
+    resolve_request_rag = make_rag_dependency(rag)
+
     @router.post(
         "/query",
         response_model=QueryResponse,
@@ -461,7 +468,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(
+        request: QueryRequest,
+        rag: LightRAG = resolve_request_rag,
+    ):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
@@ -750,7 +760,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text_stream(request: QueryRequest):
+    async def query_text_stream(
+        request: QueryRequest,
+        rag: LightRAG = resolve_request_rag,
+    ):
         """
         Advanced RAG query endpoint with flexible streaming response.
 
@@ -1323,7 +1336,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_data(request: QueryRequest):
+    async def query_data(
+        request: QueryRequest,
+        rag: LightRAG = resolve_request_rag,
+    ):
         """
         Advanced data retrieval endpoint for structured RAG analysis.
 

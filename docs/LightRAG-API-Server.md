@@ -542,6 +542,25 @@ The command-line `workspace` argument and the `WORKSPACE` environment variable i
 
 To maintain compatibility with legacy data, the default workspace for PostgreSQL is `default` and for Neo4j is `base` when no workspace is configured. For all external storages, the system provides dedicated workspace environment variables to override the common `WORKSPACE` environment variable configuration. These storage-specific workspace environment variables are: `REDIS_WORKSPACE`, `MILVUS_WORKSPACE`, `QDRANT_WORKSPACE`, `MONGODB_WORKSPACE`, `POSTGRES_WORKSPACE`, `NEO4J_WORKSPACE`, `MEMGRAPH_WORKSPACE`, `OPENSEARCH_WORKSPACE`.
 
+### Multi-Workspace Request Routing
+
+A single server process can serve multiple workspaces. API clients select the target workspace per request with the `LIGHTRAG-WORKSPACE` HTTP header:
+
+```
+curl -H "X-API-Key: your-key" -H "LIGHTRAG-WORKSPACE: space2" \
+  -X POST http://localhost:9621/query \
+  -H "Content-Type: application/json" -d '{"query": "..."}'
+```
+
+The header value is sanitized with the same rule as `--workspace` (only `a-z`, `A-Z`, `0-9`, and `_` are kept; every other character becomes `_`). When the header is absent, the request is served by the default workspace (`--workspace` / `WORKSPACE`), so existing clients and the official Web UI keep working unchanged. Query, document, graph, and Ollama-compatible endpoints all honor the header.
+
+The server creates one LightRAG instance per requested workspace on demand and caches it. All instances share the server-wide LLM/embedding/rerank functions and the process-wide PostgreSQL connection pool, so the number of physical database connections does not scale with the number of active workspaces. Two environment variables bound the cache:
+
+- `LIGHTRAG_MAX_WORKSPACES` (default `32`): maximum number of cached instances, including the default one. When the cap is exceeded, the least-recently-used non-default instance is finalized and evicted.
+- `LIGHTRAG_WORKSPACE_TTL_SECONDS` (default `86400`): idle time after which a cached non-default instance is finalized and evicted. Set to `0` to disable TTL eviction.
+
+Instances are never evicted while their workspace pipeline reports activity, and the default workspace instance is pinned for the lifetime of the process. An evicted workspace is simply rebuilt on its next request; no data is lost because all state lives in the configured storages.
+
 ### Multiple workers for Gunicorn + Uvicorn
 
 The LightRAG Server can operate in the `Gunicorn + Uvicorn` preload mode. Gunicorn's multiple worker (multiprocess) capability prevents document indexing tasks from blocking RAG queries. CPU-heavy document extraction tools should be deployed as external services so they do not block the API process.

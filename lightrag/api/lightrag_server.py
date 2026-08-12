@@ -12,7 +12,6 @@ from fastapi.openapi.docs import (
 import asyncio
 import json
 import os
-import re
 import logging
 import logging.config
 import sys
@@ -70,6 +69,11 @@ from lightrag.parser.external.mineru.cache import MinerUParserOptions
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.workspace_manager import (
+    RAGInstanceManager,
+    workspace_from_headers,
+    workspace_limits_from_env,
+)
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -1394,6 +1398,10 @@ def create_app(args):
             # Clean up database connections
             await rag.finalize_storages()
 
+            # Finalize lazily-created per-workspace instances (the default
+            # instance stays owned by the finalize above).
+            await rag_manager.aclose()
+
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
                 logger.debug("Unvicorn Mode: finalizing shared storage...")
@@ -1590,23 +1598,9 @@ def create_app(args):
             request: FastAPI Request object
 
         Returns:
-            Workspace identifier (may be empty string for global namespace)
+            Workspace identifier (None for the default workspace)
         """
-        # Check custom header first
-        workspace = request.headers.get("LIGHTRAG-WORKSPACE", "").strip()
-
-        if not workspace:
-            workspace = None
-        else:
-            sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", workspace)
-            if sanitized != workspace:
-                logger.warning(
-                    f"Workspace header '{workspace}' contains invalid characters. "
-                    f"Sanitized to '{sanitized}'."
-                )
-                workspace = sanitized
-
-        return workspace
+        return workspace_from_headers(request.headers)
 
     # Create working directory if it doesn't exist
     Path(args.working_dir).mkdir(parents=True, exist_ok=True)
@@ -2233,11 +2227,18 @@ def create_app(args):
         for spec in ROLES
     }
 
-    # Initialize RAG with unified configuration
-    try:
-        rag = LightRAG(
+    def build_rag_instance(workspace: str) -> LightRAG:
+        """Build an uninitialized LightRAG instance for one workspace.
+
+        Only the workspace name varies between instances; storage backends,
+        LLM/embedding/rerank functions and pipeline tuning are all shared
+        server configuration captured by this closure. The caller (server
+        startup for the default workspace, RAGInstanceManager for the rest)
+        drives initialize_storages()/finalize_storages().
+        """
+        instance = LightRAG(
             working_dir=args.working_dir,
-            workspace=args.workspace,
+            workspace=workspace,
             llm_model_func=create_llm_model_func(args.llm_binding),
             llm_model_name=args.llm_model,
             llm_model_max_async=args.max_async,
@@ -2300,18 +2301,49 @@ def create_app(args):
                 for spec in ROLES
             },
         )
+        instance.register_role_llm_builder(
+            lambda role, meta: (
+                create_role_llm_func(role, meta),
+                create_role_llm_model_kwargs(role, meta),
+            )
+        )
+        return instance
+
+    # Initialize the default RAG instance with unified configuration
+    try:
+        rag = build_rag_instance(args.workspace)
     except Exception as e:
         logger.error(f"Failed to initialize LightRAG: {e}")
         raise
 
     _log_role_provider_options(rag)
 
-    rag.register_role_llm_builder(
-        lambda role, meta: (
-            create_role_llm_func(role, meta),
-            create_role_llm_model_kwargs(role, meta),
+    # Multi-workspace routing (upstream issue #2904): requests carrying a
+    # LIGHTRAG-WORKSPACE header are served by a dedicated instance per
+    # workspace, created lazily by the manager from the same factory. The
+    # default instance is pinned inside the manager and remains owned by the
+    # lifespan shutdown below.
+    max_workspaces, workspace_ttl_seconds = workspace_limits_from_env()
+
+    async def _workspace_pipeline_busy(workspace: str) -> bool:
+        """Busy probe consulted before the manager evicts an instance."""
+        status = await get_namespace_data("pipeline_status", workspace=workspace)
+        snapshot = status.copy()
+        return bool(
+            snapshot.get("busy", False)
+            or snapshot.get("scanning", False)
+            or snapshot.get("destructive_busy", False)
         )
+
+    rag_manager = RAGInstanceManager(
+        build_rag_instance,
+        default_instance=rag,
+        default_workspace=args.workspace,
+        max_instances=max_workspaces,
+        ttl_seconds=workspace_ttl_seconds,
+        is_workspace_busy=_workspace_pipeline_busy,
     )
+    app.state.rag_manager = rag_manager
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
