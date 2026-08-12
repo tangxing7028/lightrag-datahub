@@ -2320,6 +2320,32 @@ def delete_file_variants_by_file_path(
     return deleted_files, errors
 
 
+def workspace_input_dir(doc_manager: "DocumentManager", workspace: str | None) -> Path:
+    """Resolve the on-disk input directory for one workspace.
+
+    Mirrors the layout :class:`DocumentManager` establishes at startup:
+    ``<base_input_dir>/<workspace>`` when a workspace is set, the base
+    directory otherwise. For the server's default workspace this equals
+    ``doc_manager.input_dir``; for a ``LIGHTRAG-WORKSPACE`` header-selected
+    instance it is that workspace's own directory, so a destructive clear
+    only touches the instance the request targeted. Falls back to
+    ``doc_manager.input_dir`` when the workspace name cannot be validated
+    (defence-in-depth: header-derived names are already sanitized upstream).
+    """
+    name = (workspace or "").strip()
+    if not name:
+        return doc_manager.base_input_dir
+    try:
+        validate_workspace(name)
+    except Exception:
+        logger.warning(
+            f"workspace_input_dir: invalid workspace name {safe_log_value(name)!r}; "
+            "falling back to the default input directory"
+        )
+        return doc_manager.input_dir
+    return doc_manager.base_input_dir / name
+
+
 async def record_scan_warning(rag: LightRAG, message: str) -> None:
     logger.warning(message)
     try:
@@ -5806,7 +5832,9 @@ def create_document_routes(
 
         This endpoint deletes all documents, entities, relationships, and files from the system.
         It uses the storage drop methods to properly clean up all data and removes all files
-        from the input directory.
+        from the input directory of the resolved workspace (``LIGHTRAG-WORKSPACE`` header),
+        including the parser artifact tree (``__parsed__/`` — sidecar and raw-bundle
+        directories), which is removed recursively.
 
         **Concurrency Constraint:**
         - Atomically reserves the destructive slot (sets ``busy=True``
@@ -6044,14 +6072,44 @@ def create_document_routes(
             deleted_files_count = 0
             file_errors_count = 0
 
-            for file_path in doc_manager.input_dir.glob("*"):
-                if file_path.is_file():
-                    try:
-                        file_path.unlink()
-                        deleted_files_count += 1
-                    except Exception as e:
-                        logger.error(f"Error deleting file {file_path}: {str(e)}")
-                        file_errors_count += 1
+            # The filesystem cleanup targets the workspace this request
+            # resolved to (LIGHTRAG-WORKSPACE header), not necessarily the
+            # startup workspace's directory doc_manager is bound to.
+            effective_input_dir = workspace_input_dir(
+                doc_manager, getattr(rag, "workspace", "")
+            )
+
+            if effective_input_dir.is_dir():
+                for file_path in effective_input_dir.glob("*"):
+                    if file_path.is_file():
+                        try:
+                            file_path.unlink()
+                            deleted_files_count += 1
+                        except Exception as e:
+                            logger.error(f"Error deleting file {file_path}: {str(e)}")
+                            file_errors_count += 1
+
+            # Parser artifact directories (``__parsed__/<base>.parsed``,
+            # ``<base>.mineru_raw``, ``<base>.docling_raw``,
+            # ``<base>.native_raw`` — see PARSED_ARTIFACT_DIR_SUFFIXES) all
+            # live under ``<input>/__parsed__/``; the top-level sweep above
+            # deliberately skips subdirectories, so without this a clear
+            # leaves every sidecar / raw bundle behind. Remove the whole
+            # tree; a missing directory is the idempotent no-op case.
+            deleted_artifact_dirs_count = 0
+            parsed_root = effective_input_dir / PARSED_DIR_NAME
+            if parsed_root.is_dir():
+                try:
+                    await asyncio.to_thread(shutil.rmtree, parsed_root)
+                    deleted_artifact_dirs_count = 1
+                    logger.info(
+                        f"/documents/clear: removed parser artifact directory {parsed_root}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Error deleting parser artifact directory {parsed_root}: {str(e)}"
+                    )
+                    file_errors_count += 1
 
             # Log file deletion results
             if file_errors_count > 0:
@@ -6068,10 +6126,16 @@ def create_document_routes(
             # Prepare final result message
             final_message = ""
             if errors:
-                final_message = f"Cleared documents with some errors. Deleted {deleted_files_count} files."
+                final_message = (
+                    f"Cleared documents with some errors. Deleted {deleted_files_count} files "
+                    f"and {deleted_artifact_dirs_count} parser artifact directories."
+                )
                 status = "partial_success"
             else:
-                final_message = f"All documents cleared successfully. Deleted {deleted_files_count} files."
+                final_message = (
+                    f"All documents cleared successfully. Deleted {deleted_files_count} files "
+                    f"and {deleted_artifact_dirs_count} parser artifact directories."
+                )
                 status = "success"
 
             # Log final result
