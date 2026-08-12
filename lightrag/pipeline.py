@@ -680,18 +680,26 @@ class _PipelineMixin:
         Args:
             input: Single document string or list of document strings (can be empty when docs_format is pending_parse)
             ids: list of unique document IDs, if not provided, MD5 hash IDs will be generated (from content or file_path).
-                **Providing ``ids`` marks the SDK raw direct-insert path**
-                (:meth:`LightRAG.ainsert`) and takes precedence over
-                ``docs_format``: the documents are always enqueued as RAW
-                — sanitized verbatim content, no parse-worker deferral —
-                by design, not as an oversight. ``pending_parse`` is the
-                server upload path, which never passes ``ids``.
+                How explicit ids combine with ``docs_format``:
+
+                - ``docs_format="raw"`` (the default) + ``ids`` is the SDK
+                  raw direct-insert path (:meth:`LightRAG.ainsert`): the
+                  documents are enqueued as RAW — sanitized verbatim
+                  content, no parse-worker deferral.
+                - ``docs_format="pending_parse"`` + ``ids`` is the server
+                  upload path with caller-assigned doc ids: the files still
+                  go through the parse worker exactly as an id-less
+                  ``pending_parse`` enqueue, but the supplied id becomes the
+                  document's ``full_doc_id`` instead of
+                  ``md5(canonical_file_path)``. Filename-based dedup
+                  (in-batch and against ``doc_status``) is unchanged — it
+                  keys off ``file_path``, not the doc id.
             file_paths: list of file paths corresponding to each document, used for citation
             track_id: tracking ID for monitoring processing status
             docs_format: "raw" (default) or "pending_parse"; "pending_parse" defers
                 extraction to the parse worker (content may be empty and
-                content-dedup happens after parsing). Ignored when ``ids``
-                is provided (see ``ids`` above).
+                content-dedup happens after parsing). When combined with
+                ``ids`` the pending_parse path wins (see ``ids`` above).
             parse_engine: file extraction engine already used or target engine for pending_parse
             process_options: per-document processing options string (i/t/e/!/F/R/V/P);
                 accepted as a single string broadcast to every input or as a list
@@ -1055,24 +1063,28 @@ class _PipelineMixin:
             content_data["chunk_options"] = _chunk_options_at(index)
             contents[doc_id] = content_data
 
-        # ``ids`` outranks ``docs_format`` by design: explicit ids mark the
-        # SDK raw direct-insert path (ainsert), which always enqueues the
-        # sanitized body as RAW. pending_parse (server upload) never passes
-        # ids, so the two never legitimately combine.
-        if ids is not None:
+        # ``docs_format`` decides the ingestion path; ``ids`` only overrides
+        # the generated doc id within that path. pending_parse (server
+        # upload) defers parsing to the parse worker whether or not the
+        # caller supplied ids — an id-less pending_parse enqueue hashes the
+        # canonical file path, an id-bearing one uses the caller's id as the
+        # full_doc_id end to end. RAW + ids remains the SDK raw
+        # direct-insert path (ainsert): sanitized verbatim content, no
+        # parse-worker deferral.
+        if docs_format == FULL_DOCS_FORMAT_PENDING_PARSE:
+            for i, doc in enumerate(input):
+                _add_content(
+                    i,
+                    doc or "",
+                    FULL_DOCS_FORMAT_PENDING_PARSE,
+                )
+        elif ids is not None:
             for i, doc in enumerate(input):
                 cleaned_content = sanitize_text_for_encoding(doc)
                 _add_content(
                     i,
                     cleaned_content,
                     FULL_DOCS_FORMAT_RAW,
-                )
-        elif docs_format == FULL_DOCS_FORMAT_PENDING_PARSE:
-            for i, doc in enumerate(input):
-                _add_content(
-                    i,
-                    doc or "",
-                    FULL_DOCS_FORMAT_PENDING_PARSE,
                 )
         else:
             for i, doc in enumerate(input):

@@ -42,6 +42,7 @@ from fastapi import (
     APIRouter,
     Depends,
     File,
+    Form,
     HTTPException,
     Query,
     Request,
@@ -370,6 +371,48 @@ def upload_file_opener(input_dir: Path):
             dir_fd = -1
 
     return opener
+
+
+# Caller-supplied doc ids (POST /documents/upload ``doc_id`` form field)
+# become storage primary keys (full_docs / doc_status) and ride every
+# downstream reference (chunks' full_doc_id, track_status responses), so
+# they are restricted to a conservative charset. Snowflake-style numeric
+# ids and ``doc-``-prefixed hashes both fit this rule.
+MAX_CUSTOM_DOC_ID_LENGTH = 128
+_CUSTOM_DOC_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def validate_custom_doc_id(doc_id: str | None) -> str | None:
+    """Validate an optional caller-supplied doc id for the upload endpoint.
+
+    Returns the stripped id, or None when the caller did not supply one.
+    Non-string values (e.g. the ``Form(...)`` marker seen when the endpoint
+    function is invoked directly, bypassing FastAPI's dependency injection)
+    are treated as "not supplied".
+
+    Raises:
+        HTTPException: 400 when the id is blank or contains characters
+            outside ``[A-Za-z0-9_-]`` / exceeds the length cap.
+    """
+    if not isinstance(doc_id, str):
+        return None
+    stripped = doc_id.strip()
+    if not stripped:
+        raise HTTPException(
+            status_code=400,
+            detail="doc_id must be a non-empty string when provided",
+        )
+    if len(stripped) > MAX_CUSTOM_DOC_ID_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"doc_id exceeds the maximum length of {MAX_CUSTOM_DOC_ID_LENGTH} characters",
+        )
+    if not _CUSTOM_DOC_ID_PATTERN.fullmatch(stripped):
+        raise HTTPException(
+            status_code=400,
+            detail="doc_id may only contain letters, digits, hyphens and underscores, and must start with a letter or digit",
+        )
+    return stripped
 
 
 class ScanResponse(BaseModel):
@@ -2329,6 +2372,7 @@ async def pipeline_enqueue_file(
     from_scan: bool = False,
     admission_token: str | None = None,
     known_file_size: int | None = None,
+    doc_id: str | None = None,
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -2348,6 +2392,10 @@ async def pipeline_enqueue_file(
             candidate spool recorded at discovery time; it feeds error reports
             only, so a size that went stale between discovery and enqueue costs
             nothing.
+        doc_id: optional caller-assigned document id (upload path only). When
+            provided it is forwarded as the enqueue ``ids`` override so the
+            pending_parse pipeline uses it as the document's full_doc_id
+            instead of ``md5(canonical file_path)``.
     Returns:
         tuple: (success: bool, track_id: str)
     """
@@ -2464,6 +2512,10 @@ async def pipeline_enqueue_file(
                 # Only sent when the caller actually holds a reservation; None
                 # is the enqueue's own default and adding it would be noise.
                 enqueue_kwargs["admission_token"] = admission_token
+            if doc_id is not None:
+                # Caller-assigned id (upload path): pending_parse honors it as
+                # the full_doc_id instead of md5(canonical file_path).
+                enqueue_kwargs["ids"] = [doc_id]
             if hint_chunk_options is not None:
                 enqueue_kwargs["chunk_options"] = hint_chunk_options
             enqueue_result = await rag.apipeline_enqueue_documents("", **enqueue_kwargs)
@@ -2527,6 +2579,7 @@ async def pipeline_index_file(
     file_path: Path,
     track_id: str = None,
     admission_token: str | None = None,
+    doc_id: str | None = None,
 ):
     """Index a file with track_id
 
@@ -2537,10 +2590,12 @@ async def pipeline_index_file(
         admission_token: the endpoint's pending-enqueue reservation, forwarded
             so the admission guard re-weights THAT token to the deduped count
             instead of counting this request twice (LR2 §9.2)
+        doc_id: optional caller-assigned document id, forwarded to
+            ``pipeline_enqueue_file`` (upload path only)
     """
     try:
         success, _ = await pipeline_enqueue_file(
-            rag, file_path, track_id, admission_token=admission_token
+            rag, file_path, track_id, admission_token=admission_token, doc_id=doc_id
         )
         if success:
             await rag.apipeline_process_enqueue_documents()
@@ -5068,6 +5123,7 @@ def create_document_routes(
     async def upload_to_input_dir(
         managed_tasks: set = Depends(get_managed_background_tasks),
         file: UploadFile = File(...),
+        doc_id: Optional[str] = Form(None),
         http_request: Request = None,
         rag: LightRAG = resolve_request_rag,
     ):
@@ -5135,6 +5191,13 @@ def create_document_routes(
                 (see get_managed_background_tasks) — the reservation-holding work
                 runs as a tracked asyncio task, not a Starlette callback
             file (UploadFile): The file to be uploaded. It must have an allowed extension.
+            doc_id (str, optional): caller-assigned document id (multipart form
+                field). When provided, the pending_parse pipeline uses it as the
+                document's full_doc_id instead of ``md5(canonical file_path)``;
+                track_status / doc_status responses key off it. A workspace that
+                already holds this id returns 409, unless the existing document
+                is FAILED — then the failed record is deleted first and the
+                upload proceeds as a clean retry.
 
         Returns:
             InsertResponse: A response object containing the upload status and a message.
@@ -5239,6 +5302,72 @@ def create_document_routes(
                     ),
                 )
 
+            # Optional caller-assigned doc id. Validated BEFORE any byte is
+            # written so a rejected id never leaves a file behind. The id
+            # becomes the document's full_doc_id end to end (pending_parse
+            # honors the enqueue ``ids`` override), so it must not collide
+            # with a live document in this workspace: an existing non-FAILED
+            # record is a 409 (same semantics as the same-name 409 above —
+            # delete the existing document first). A FAILED record is the
+            # retry case: it is removed via the sanctioned deletion path
+            # (which purges any staged chunks a mid-processing failure left
+            # behind) before the upload proceeds.
+            requested_doc_id = validate_custom_doc_id(doc_id)
+            if requested_doc_id is not None:
+                existing_by_id = await rag.doc_status.get_by_id(requested_doc_id)
+                if existing_by_id:
+                    existing_id_status = (
+                        get_doc_status_value(existing_by_id) or "unknown"
+                    )
+                    if existing_id_status != DocStatus.FAILED.value:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Document storage already contains doc_id "
+                                f"'{requested_doc_id}' (Status: {existing_id_status}). "
+                                "Delete the existing record before re-uploading."
+                            ),
+                        )
+                    retry_file_path = (
+                        existing_by_id.get("file_path")
+                        if isinstance(existing_by_id, dict)
+                        else None
+                    )
+                    deletion = await rag.adelete_by_doc_id(requested_doc_id)
+                    if deletion.status == "not_allowed":
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Cannot retire the failed document '{requested_doc_id}' "
+                                f"while the pipeline is busy: {deletion.message}"
+                            ),
+                        )
+                    if deletion.status == "fail":
+                        raise HTTPException(
+                            status_code=500,
+                            detail=(
+                                f"Failed to retire the failed document "
+                                f"'{requested_doc_id}' before re-upload: {deletion.message}"
+                            ),
+                        )
+                    if deletion.status == "success":
+                        # Best-effort: drop the stale source file / parsed
+                        # artifacts of the failed upload so a later scan
+                        # cannot re-ingest them under a hash id. Failures
+                        # here must not block the accepted retry.
+                        stale_path = deletion.file_path or retry_file_path
+                        _, stale_errors = delete_file_variants_by_file_path(
+                            doc_manager.input_dir, stale_path
+                        )
+                        for stale_error in stale_errors:
+                            logger.warning(
+                                f"/documents/upload retry cleanup: {stale_error}"
+                            )
+                        logger.info(
+                            f"/documents/upload: retired failed document "
+                            f"'{requested_doc_id}' for caller-requested re-upload"
+                        )
+
             # Async streaming write with size check
             bytes_written = 0
             chunk_size = 1024 * 1024  # 1MB chunks
@@ -5336,6 +5465,7 @@ def create_document_routes(
                         file_path,
                         track_id,
                         admission_token=enqueue_token,
+                        doc_id=requested_doc_id,
                     )
                 finally:
                     await _release_enqueue_slot(rag, enqueue_token)

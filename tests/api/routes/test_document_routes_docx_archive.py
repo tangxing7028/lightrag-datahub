@@ -1423,7 +1423,9 @@ async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypat
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _gated_index(
+        rag_arg, file_path, track_id=None, admission_token=None, doc_id=None
+    ):
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
@@ -1566,7 +1568,9 @@ async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatc
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _gated_index(
+        rag_arg, file_path, track_id=None, admission_token=None, doc_id=None
+    ):
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
@@ -2499,7 +2503,9 @@ async def test_two_concurrent_uploads_both_succeed_when_pipeline_busy(
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _gated_index(
+        rag_arg, file_path, track_id=None, admission_token=None, doc_id=None
+    ):
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
@@ -2912,7 +2918,9 @@ async def test_upload_managed_task_released_on_shutdown_drain(tmp_path, monkeypa
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _gated_index(
+        rag_arg, file_path, track_id=None, admission_token=None, doc_id=None
+    ):
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
