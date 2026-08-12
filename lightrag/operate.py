@@ -5046,10 +5046,25 @@ async def _perform_kg_search(
         )
 
     else:  # hybrid or mix mode
-        if len(ll_keywords) > 0:
+        # The local (entities), global (relationships) and vector-chunk
+        # branches have no data dependencies on each other, so run them
+        # concurrently.
+        #
+        # Progress events: each branch emits its own event when it starts,
+        # so events from concurrent branches may interleave and their
+        # relative order is not guaranteed. They are informational only.
+        #
+        # Failure semantics: gather is used WITHOUT return_exceptions —
+        # the first branch failure must abort the whole search rather than
+        # silently degrade to partial context. Plain gather() lets the
+        # remaining tasks keep running after the first exception, so on any
+        # error (including cancellation of the outer coroutine) the
+        # surviving branch tasks are explicitly cancelled and awaited
+        # before the exception propagates.
+        async def _local_branch():
             if progress_callback:
                 await progress_callback(QueryProgress.RETRIEVING_ENTITIES)
-            local_entities, local_relations = await _get_node_data(
+            return await _get_node_data(
                 ll_keywords,
                 knowledge_graph_inst,
                 entities_vdb,
@@ -5057,10 +5072,11 @@ async def _perform_kg_search(
                 query_embedding=ll_embedding,
                 chunks_vdb=chunks_vdb,
             )
-        if len(hl_keywords) > 0:
+
+        async def _global_branch():
             if progress_callback:
                 await progress_callback(QueryProgress.RETRIEVING_RELATIONS)
-            global_relations, global_entities = await _get_edge_data(
+            return await _get_edge_data(
                 hl_keywords,
                 knowledge_graph_inst,
                 relationships_vdb,
@@ -5068,16 +5084,43 @@ async def _perform_kg_search(
                 query_embedding=hl_embedding,
             )
 
-        # Get vector chunks for mix mode
-        if query_param.mode == "mix" and chunks_vdb:
+        async def _vector_branch():
             if progress_callback:
                 await progress_callback(QueryProgress.RETRIEVING_CHUNKS)
-            vector_chunks = await _get_vector_context(
+            return await _get_vector_context(
                 query,
                 chunks_vdb,
                 query_param,
                 query_embedding,
             )
+
+        branch_tasks: dict[str, asyncio.Task] = {}
+        if len(ll_keywords) > 0:
+            branch_tasks["local"] = asyncio.create_task(_local_branch())
+        if len(hl_keywords) > 0:
+            branch_tasks["global"] = asyncio.create_task(_global_branch())
+        # Vector chunks are only retrieved for mix mode
+        if query_param.mode == "mix" and chunks_vdb:
+            branch_tasks["vector"] = asyncio.create_task(_vector_branch())
+
+        branch_names = list(branch_tasks.keys())
+        try:
+            branch_results = await asyncio.gather(*branch_tasks.values())
+        except BaseException:
+            for task in branch_tasks.values():
+                task.cancel()
+            # Drain the cancelled tasks so none are left running (or
+            # logging "exception never retrieved") after we re-raise.
+            await asyncio.gather(*branch_tasks.values(), return_exceptions=True)
+            raise
+        results_by_branch = dict(zip(branch_names, branch_results))
+
+        if "local" in results_by_branch:
+            local_entities, local_relations = results_by_branch["local"]
+        if "global" in results_by_branch:
+            global_relations, global_entities = results_by_branch["global"]
+        if "vector" in results_by_branch:
+            vector_chunks = results_by_branch["vector"]
             # Track vector chunks with source metadata
             for i, chunk in enumerate(vector_chunks):
                 chunk_id = chunk.get("chunk_id") or chunk.get("id")
