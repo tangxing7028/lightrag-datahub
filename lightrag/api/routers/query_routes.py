@@ -118,6 +118,23 @@ class QueryRequest(BaseModel):
         description="Enable reranking for retrieved text chunks. If True but no rerank model is configured, a warning will be issued. Default is True.",
     )
 
+    doc_ids: Optional[List[str]] = Field(
+        default=None,
+        description="Optional allow-list of document IDs restricting retrieval scope. "
+        "Omit (null) for no filtering. An empty list means zero authorized documents "
+        "and returns no retrieval results (fail-closed). "
+        "Currently only enforced by the PostgreSQL vector storage backend.",
+    )
+
+    cosine_threshold: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Optional per-query cosine similarity threshold override for vector retrieval. "
+        "Omit (null) to use the storage-level default. "
+        "Currently only enforced by the PostgreSQL vector storage backend.",
+    )
+
     include_references: Optional[bool] = Field(
         default=True,
         description="If True, includes reference list in responses. Affects /query and /query/stream endpoints. /query/data always includes references.",

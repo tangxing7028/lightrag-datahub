@@ -412,7 +412,12 @@ class NanoVectorDBStorage(BaseVectorStorage):
         atomic_write(self._client_file_name, _save_atomic, self.workspace or "_")
 
     async def query(
-        self, query: str, top_k: int, query_embedding: list[float] = None
+        self,
+        query: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+        doc_ids: list[str] | None = None,
+        cosine_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
         """Similarity search over data already materialized into ``self._client``.
 
@@ -421,6 +426,12 @@ class NanoVectorDBStorage(BaseVectorStorage):
         Use the read-your-writes paths (``get_by_id`` / ``get_by_ids`` /
         ``get_vectors_by_ids``) to observe pending data before a flush.
         """
+        if doc_ids is not None:
+            logger.warning(
+                "NanoVectorDBStorage does not implement doc_ids filtering; "
+                "the parameter is accepted for interface compatibility and "
+                "ignored. Only PGVectorStorage enforces document allow-lists."
+            )
         # Use provided embedding or compute it
         if query_embedding is not None:
             embedding = query_embedding
