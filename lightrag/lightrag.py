@@ -4061,6 +4061,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             conversation_history=param.conversation_history,
             user_prompt=param.user_prompt,
             enable_rerank=param.enable_rerank,
+            # Fork additions: keep the retrieval allow-list / threshold intact,
+            # otherwise /query/data silently drops doc_ids and filters nothing.
+            doc_ids=param.doc_ids,
+            cosine_threshold=param.cosine_threshold,
         )
 
         query_result = None
