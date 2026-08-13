@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 PARSER_ENGINE_REUSE = "reuse"
 PARSER_ENGINE_PASSTHROUGH = "passthrough"
 
-_VALID_MINERU_API_MODES = {"official", "local"}
+_VALID_MINERU_API_MODES = {"official", "local", "wrapper"}
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +48,8 @@ def _mineru_endpoint_configured() -> bool:
         return bool(os.getenv("MINERU_API_TOKEN", "").strip())
     if mode == "local":
         return bool(os.getenv("MINERU_LOCAL_ENDPOINT", "").strip())
+    if mode == "wrapper":
+        return bool(os.getenv("MINERU_WRAPPER_ENDPOINT", "").strip())
     return False
 
 
@@ -57,6 +59,8 @@ def _mineru_endpoint_requirement() -> str | None:
         return "MINERU_API_TOKEN"
     if mode == "local":
         return "MINERU_LOCAL_ENDPOINT"
+    if mode == "wrapper":
+        return "MINERU_WRAPPER_ENDPOINT"
     allowed = ", ".join(sorted(_VALID_MINERU_API_MODES))
     return f"valid MINERU_API_MODE ({allowed})"
 

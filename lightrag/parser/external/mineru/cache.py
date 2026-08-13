@@ -112,7 +112,7 @@ def _current_api_mode() -> str:
 
 def _normalize_api_mode(mode: str) -> str:
     mode = str(mode or "").strip().lower()
-    return mode if mode in {"official", "local"} else DEFAULT_MINERU_API_MODE
+    return mode if mode in {"official", "local", "wrapper"} else DEFAULT_MINERU_API_MODE
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -147,6 +147,8 @@ def _current_endpoint_signature() -> str:
         )
     if mode == "local":
         return os.getenv("MINERU_LOCAL_ENDPOINT", "").strip().rstrip("/")
+    if mode == "wrapper":
+        return os.getenv("MINERU_WRAPPER_ENDPOINT", "").strip().rstrip("/")
     return ""
 
 
@@ -305,6 +307,18 @@ def mineru_options_signature(
                 or DEFAULT_MINERU_MODEL_VERSION,
                 "is_ocr": bool(is_ocr),
                 "page_ranges": str(page_ranges or "").strip(),
+            }
+        )
+    elif mode == "wrapper":
+        # The wrapper protocol sends backend/method (and the base language /
+        # table / formula options above) but has no image-analysis or
+        # page-bound knobs, so those stay out of its cache key.
+        payload.update(
+            {
+                "local_backend": str(local_backend or "").strip()
+                or DEFAULT_MINERU_LOCAL_BACKEND,
+                "local_parse_method": str(local_parse_method or "").strip()
+                or DEFAULT_MINERU_LOCAL_PARSE_METHOD,
             }
         )
     else:

@@ -11,6 +11,7 @@ the call, the raw dir contains:
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import zipfile
@@ -1127,3 +1128,472 @@ async def test_client_local_result_bundle_byte_budget_is_enforced(
     with pytest.raises(RuntimeError, match="uncompressed size"):
         await MinerURawClient().download_into(raw, src)
     assert not (raw / "content_list.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# wrapper mode: single synchronous POST {endpoint}/predict with base64 body
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _propagate_lightrag_logger(monkeypatch: pytest.MonkeyPatch):
+    # The ``lightrag`` logger sets ``propagate=False`` (see lightrag.utils),
+    # so caplog never sees its records unless propagation is re-enabled.
+    import logging
+
+    monkeypatch.setattr(logging.getLogger("lightrag"), "propagate", True)
+
+
+WRAPPER_ENDPOINT = "http://127.0.0.1:8001"
+
+
+def _wrapper_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINERU_API_MODE", "wrapper")
+    monkeypatch.setenv("MINERU_WRAPPER_ENDPOINT", WRAPPER_ENDPOINT)
+    monkeypatch.setenv("MINERU_LOCAL_BACKEND", "pipeline")
+    monkeypatch.setenv("MINERU_LOCAL_PARSE_METHOD", "auto")
+    monkeypatch.setenv("MINERU_LANGUAGE", "ch")
+
+
+class _WrapperDispatcher(_Dispatcher):
+    """Base wrapper dispatcher: captures the /predict payload."""
+
+    response_text: str = ""
+
+    def __init__(self) -> None:
+        self.predict_payload: dict[str, Any] | None = None
+
+    def post(self, url: str, **kwargs: Any) -> _FakeResponse:
+        if url == f"{WRAPPER_ENDPOINT}/predict":
+            self.predict_payload = kwargs.get("json")
+            return _FakeResponse(text=self.response_text)
+        raise AssertionError(f"unexpected POST {url}")
+
+
+def _wrapper_md_only_zip() -> bytes:
+    """Package zip with markdown + images but NO content_list JSON."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "demo/auto/demo.md",
+            "# Title\n\n![fig](images/img_010.png)\n",
+        )
+        zf.writestr("demo/auto/images/img_010.png", b"\x89PNGmd-only")
+    return buf.getvalue()
+
+
+class _WrapperPackageDispatcher(_WrapperDispatcher):
+    response_text = json.dumps({"package_url": "http://files.example/demo.zip"})
+
+    def get(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://files.example/demo.zip":
+            return _FakeResponse(
+                content=_nested_mineru_zip(),
+                headers={"Content-Type": "application/zip"},
+            )
+        raise AssertionError(f"unexpected GET {url}")
+
+
+@pytest.mark.offline
+async def test_client_wrapper_package_url_round_trip(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrapper_env(monkeypatch)
+
+    src = tmp_path / "demo.pdf"
+    src.write_bytes(b"PDFBYTES" * 200)
+    raw = tmp_path / "demo.mineru_raw"
+    raw.mkdir()
+
+    dispatcher = _WrapperPackageDispatcher()
+    _CURRENT.dispatcher = dispatcher
+    manifest = await MinerURawClient().download_into(raw, src)
+
+    # Request shape: base64 file + options sourced from the existing env knobs.
+    assert dispatcher.predict_payload is not None
+    assert base64.b64decode(dispatcher.predict_payload["file"]) == src.read_bytes()
+    options = dispatcher.predict_payload["options"]
+    assert options == {
+        "orig_suffix": ".pdf",
+        "method": "auto",
+        "backend": "pipeline",
+        "lang": "ch",
+        "formula_enable": True,
+        "table_enable": True,
+    }
+
+    # Package path reuses the shared zip download + normalization contract.
+    assert manifest.api_mode == "wrapper"
+    assert manifest.endpoint_signature == WRAPPER_ENDPOINT
+    assert manifest.options_signature.startswith("sha256:")
+    assert (raw / "content_list.json").is_file()
+    assert (raw / "images" / "img_001.png").read_bytes() == b"\x89PNGnested"
+    assert is_bundle_valid(raw, src) is True
+
+
+class _WrapperContentListDispatcher(_WrapperDispatcher):
+    response_text = json.dumps(
+        {
+            "content_list": [
+                {"type": "text", "text": "hello wrapper", "page_idx": 0},
+            ]
+        }
+    )
+
+
+@pytest.mark.offline
+async def test_client_wrapper_inline_content_list_lands_at_root(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    _propagate_lightrag_logger,
+) -> None:
+    _wrapper_env(monkeypatch)
+
+    src = tmp_path / "demo.pdf"
+    src.write_bytes(b"PDFBYTES" * 200)
+    raw = tmp_path / "demo.mineru_raw"
+    raw.mkdir()
+
+    import logging
+
+    _CURRENT.dispatcher = _WrapperContentListDispatcher()
+    with caplog.at_level(logging.WARNING, logger="lightrag"):
+        manifest = await MinerURawClient().download_into(raw, src)
+
+    # No package_url means no image bytes: the warning must be visible.
+    assert any("no image bytes" in rec.message for rec in caplog.records)
+
+    content_list = json.loads((raw / "content_list.json").read_text())
+    assert content_list == [
+        {"type": "text", "text": "hello wrapper", "page_idx": 0}
+    ]
+    assert manifest.critical_file.path == "content_list.json"
+    assert is_bundle_valid(raw, src) is True
+
+    # Downstream contract: the IR builder reads the bundle as-is.
+    from lightrag.parser.external.mineru import MinerUIRBuilder
+
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="demo.pdf")
+    assert ir.blocks
+    assert "hello wrapper" in ir.blocks[0].content_template
+
+
+WRAPPER_MD = (
+    "# Heading\n\n"
+    "Some text.\n\n"
+    "![chart](images/chart_1.png)\n\n"
+    '<img src="images/chart_2.png" alt="c2">\n\n'
+    "![evil](../escape.png)\n\n"
+    "![remote](http://other.example/skip.png)\n"
+)
+
+
+class _WrapperMdUrlDispatcher(_WrapperDispatcher):
+    response_text = json.dumps({"md_url": "http://files.example/out/demo.md"})
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.asset_gets: list[str] = []
+
+    def get(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://files.example/out/demo.md":
+            return _FakeResponse(text=WRAPPER_MD)
+        if url == "http://files.example/out/images/chart_1.png":
+            self.asset_gets.append(url)
+            return _FakeResponse(content=b"\x89PNGchart1")
+        if url == "http://files.example/out/images/chart_2.png":
+            self.asset_gets.append(url)
+            return _FakeResponse(content=b"\x89PNGchart2")
+        if url == "http://files.example/escape.png":
+            # Must never be requested: the ref escapes raw_dir.
+            raise AssertionError("path-traversal ref was downloaded")
+        raise AssertionError(f"unexpected GET {url}")
+
+
+@pytest.mark.offline
+async def test_client_wrapper_md_url_downloads_assets_with_traversal_guard(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrapper_env(monkeypatch)
+
+    src = tmp_path / "demo.pdf"
+    src.write_bytes(b"PDFBYTES" * 200)
+    raw = tmp_path / "demo.mineru_raw"
+    raw.mkdir()
+
+    dispatcher = _WrapperMdUrlDispatcher()
+    _CURRENT.dispatcher = dispatcher
+    manifest = await MinerURawClient().download_into(raw, src)
+
+    # Markdown lands at raw_dir root; relative assets under images/.
+    assert (raw / "demo.md").read_text(encoding="utf-8") == WRAPPER_MD
+    assert (raw / "images" / "chart_1.png").read_bytes() == b"\x89PNGchart1"
+    assert (raw / "images" / "chart_2.png").read_bytes() == b"\x89PNGchart2"
+    assert sorted(dispatcher.asset_gets) == [
+        "http://files.example/out/images/chart_1.png",
+        "http://files.example/out/images/chart_2.png",
+    ]
+    # Traversal / remote refs neither downloaded nor written anywhere.
+    assert not (tmp_path / "escape.png").exists()
+    assert not (raw / "escape.png").exists()
+
+    # Synthesized content_list carries the text plus the landed images.
+    content_list = json.loads((raw / "content_list.json").read_text())
+    assert content_list[0]["type"] == "text"
+    assert content_list[0]["text"] == WRAPPER_MD
+    img_paths = sorted(
+        item["img_path"] for item in content_list if item["type"] == "image"
+    )
+    assert img_paths == ["images/chart_1.png", "images/chart_2.png"]
+    assert is_bundle_valid(raw, src) is True
+
+    from lightrag.parser.external.mineru import MinerUIRBuilder
+
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="demo.pdf")
+    assert ir.blocks
+
+
+class _WrapperInlineMdDispatcher(_WrapperDispatcher):
+    response_text = json.dumps({"md": "# Inline\n\nNo assets here.\n"})
+
+
+@pytest.mark.offline
+async def test_client_wrapper_inline_markdown_delivery(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrapper_env(monkeypatch)
+
+    src = tmp_path / "demo.pdf"
+    src.write_bytes(b"PDFBYTES" * 200)
+    raw = tmp_path / "demo.mineru_raw"
+    raw.mkdir()
+
+    _CURRENT.dispatcher = _WrapperInlineMdDispatcher()
+    await MinerURawClient().download_into(raw, src)
+
+    assert (raw / "demo.md").is_file()
+    content_list = json.loads((raw / "content_list.json").read_text())
+    assert content_list[0]["text"].startswith("# Inline")
+    assert is_bundle_valid(raw, src) is True
+
+
+class _WrapperMdOnlyPackageDispatcher(_WrapperDispatcher):
+    response_text = json.dumps({"package_url": "http://files.example/md.zip"})
+
+    def get(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://files.example/md.zip":
+            return _FakeResponse(
+                content=_wrapper_md_only_zip(),
+                headers={"Content-Type": "application/zip"},
+            )
+        raise AssertionError(f"unexpected GET {url}")
+
+
+@pytest.mark.offline
+async def test_client_wrapper_package_without_content_list_falls_back_to_md(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A package carrying only markdown is not an error: content_list.json is
+    synthesized from the bundle md, with image refs resolved relative to the
+    md file's directory."""
+    _wrapper_env(monkeypatch)
+
+    src = tmp_path / "demo.pdf"
+    src.write_bytes(b"PDFBYTES" * 200)
+    raw = tmp_path / "demo.mineru_raw"
+    raw.mkdir()
+
+    _CURRENT.dispatcher = _WrapperMdOnlyPackageDispatcher()
+    await MinerURawClient().download_into(raw, src)
+
+    # Single-top-dir hoist puts the md subtree at raw_dir root.
+    assert (raw / "auto" / "demo.md").is_file()
+    content_list = json.loads((raw / "content_list.json").read_text())
+    assert content_list[0]["type"] == "text"
+    img_paths = [
+        item["img_path"] for item in content_list if item["type"] == "image"
+    ]
+    assert img_paths == ["auto/images/img_010.png"]
+    assert (raw / "auto" / "images" / "img_010.png").read_bytes() == (
+        b"\x89PNGmd-only"
+    )
+    assert is_bundle_valid(raw, src) is True
+
+
+class _WrapperEmptyDispatcher(_WrapperDispatcher):
+    response_text = ""
+
+
+class _WrapperNoDeliveryDispatcher(_WrapperDispatcher):
+    response_text = json.dumps({"status": "ok"})
+
+
+class _WrapperBadPackageDispatcher(_WrapperDispatcher):
+    response_text = json.dumps({"package_url": "http://files.example/bad.zip"})
+
+    def get(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://files.example/bad.zip":
+            return _FakeResponse(status_code=500, text="boom")
+        raise AssertionError(f"unexpected GET {url}")
+
+
+class _WrapperEmptyPackageDispatcher(_WrapperDispatcher):
+    response_text = json.dumps({"package_url": "http://files.example/empty.zip"})
+
+    def get(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://files.example/empty.zip":
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr("readme.txt", "no parse artifacts here")
+            return _FakeResponse(
+                content=buf.getvalue(),
+                headers={"Content-Type": "application/zip"},
+            )
+        raise AssertionError(f"unexpected GET {url}")
+
+
+class _WrapperBadMdUrlDispatcher(_WrapperDispatcher):
+    response_text = json.dumps({"md_url": "http://files.example/out/gone.md"})
+
+    def get(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://files.example/out/gone.md":
+            return _FakeResponse(status_code=404, text="not found")
+        raise AssertionError(f"unexpected GET {url}")
+
+
+class _WrapperFlakyAssetDispatcher(_WrapperMdUrlDispatcher):
+    def get(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://files.example/out/images/chart_2.png":
+            return _FakeResponse(status_code=500, text="asset boom")
+        return super().get(url, **_)
+
+
+def _wrapper_src_and_raw(tmp_path: Path) -> tuple[Path, Path]:
+    src = tmp_path / "demo.pdf"
+    src.write_bytes(b"PDFBYTES" * 200)
+    raw = tmp_path / "demo.mineru_raw"
+    raw.mkdir()
+    return src, raw
+
+
+@pytest.mark.offline
+async def test_client_wrapper_empty_response_raises(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrapper_env(monkeypatch)
+    src, raw = _wrapper_src_and_raw(tmp_path)
+
+    _CURRENT.dispatcher = _WrapperEmptyDispatcher()
+    with pytest.raises(RuntimeError, match="empty or non-object"):
+        await MinerURawClient().download_into(raw, src)
+
+
+@pytest.mark.offline
+async def test_client_wrapper_response_without_delivery_raises(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrapper_env(monkeypatch)
+    src, raw = _wrapper_src_and_raw(tmp_path)
+
+    _CURRENT.dispatcher = _WrapperNoDeliveryDispatcher()
+    with pytest.raises(RuntimeError, match="no usable delivery"):
+        await MinerURawClient().download_into(raw, src)
+
+
+@pytest.mark.offline
+async def test_client_wrapper_package_download_failure_raises(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrapper_env(monkeypatch)
+    src, raw = _wrapper_src_and_raw(tmp_path)
+
+    _CURRENT.dispatcher = _WrapperBadPackageDispatcher()
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        await MinerURawClient().download_into(raw, src)
+
+
+@pytest.mark.offline
+async def test_client_wrapper_package_without_any_text_artifact_raises(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrapper_env(monkeypatch)
+    src, raw = _wrapper_src_and_raw(tmp_path)
+
+    _CURRENT.dispatcher = _WrapperEmptyPackageDispatcher()
+    with pytest.raises(RuntimeError, match="neither"):
+        await MinerURawClient().download_into(raw, src)
+
+
+@pytest.mark.offline
+async def test_client_wrapper_md_url_download_failure_raises(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrapper_env(monkeypatch)
+    src, raw = _wrapper_src_and_raw(tmp_path)
+
+    _CURRENT.dispatcher = _WrapperBadMdUrlDispatcher()
+    with pytest.raises(RuntimeError, match="HTTP 404"):
+        await MinerURawClient().download_into(raw, src)
+
+
+@pytest.mark.offline
+async def test_client_wrapper_asset_failure_degrades_to_warning(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    _propagate_lightrag_logger,
+) -> None:
+    """A single broken image asset must not fail the parse: text continues,
+    only the failed image is missing from the synthesized content_list."""
+    _wrapper_env(monkeypatch)
+    src, raw = _wrapper_src_and_raw(tmp_path)
+
+    import logging
+
+    _CURRENT.dispatcher = _WrapperFlakyAssetDispatcher()
+    with caplog.at_level(logging.WARNING, logger="lightrag"):
+        await MinerURawClient().download_into(raw, src)
+
+    assert any("asset download failed" in rec.message for rec in caplog.records)
+    assert (raw / "images" / "chart_1.png").is_file()
+    assert not (raw / "images" / "chart_2.png").exists()
+    content_list = json.loads((raw / "content_list.json").read_text())
+    img_paths = [
+        item["img_path"] for item in content_list if item["type"] == "image"
+    ]
+    assert img_paths == ["images/chart_1.png"]
+    assert is_bundle_valid(raw, src) is True
+
+
+@pytest.mark.offline
+def test_client_wrapper_endpoint_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINERU_API_MODE", "wrapper")
+    monkeypatch.delenv("MINERU_WRAPPER_ENDPOINT", raising=False)
+    with pytest.raises(ValueError, match="MINERU_WRAPPER_ENDPOINT"):
+        MinerURawClient()
+
+    monkeypatch.setenv("MINERU_WRAPPER_ENDPOINT", f"{WRAPPER_ENDPOINT}/predict")
+    with pytest.raises(ValueError, match="MINERU_WRAPPER_ENDPOINT"):
+        MinerURawClient()
