@@ -275,7 +275,7 @@ class _ScanFullDocs:
 
 
 class _ScanRag:
-    def __init__(self, docs_by_path, full_docs_by_id=None):
+    def __init__(self, docs_by_path, full_docs_by_id=None, workspace=None):
         self.doc_status = _ScanDocStatus(docs_by_path)
         # Default: every doc_status row has a corresponding full_docs entry,
         # i.e. the "resumable" FAILED case.  Tests simulating extraction-error
@@ -290,7 +290,10 @@ class _ScanRag:
         # request that only a REAL pipeline run ACKs, and the /scan reservation
         # refuses while an earlier request is queued (LR2 §8.1). With a shared
         # workspace one endpoint test would then refuse the next one.
-        self.workspace = f"scan-test-{uuid4().hex}"
+        # Tests that seed files on disk pass an explicit workspace and seed
+        # into <base>/<workspace> — the directory scan/upload now route to
+        # (header-workspace input-dir resolution, ④f).
+        self.workspace = workspace or f"scan-test-{uuid4().hex}"
         self.reset_calls = []
         self.enqueued = []
         self.errors = []
@@ -335,9 +338,9 @@ class _ScanRag:
 
 
 class _DuplicateUploadRag:
-    def __init__(self, docs_by_path):
+    def __init__(self, docs_by_path, workspace=None):
         self.doc_status = _ScanDocStatus(docs_by_path)
-        self.workspace = f"upload-test-{uuid4().hex}"
+        self.workspace = workspace or f"upload-test-{uuid4().hex}"
 
 
 class _DeleteRag:
@@ -791,9 +794,12 @@ async def test_pipeline_index_texts_sets_api_default_process_options():
 async def test_scan_processed_same_name_archives_with_unique_name(
     tmp_path, monkeypatch
 ):
-    file_path = tmp_path / "already-parsed.docx"
+    workspace = f"scan-ws-{uuid4().hex[:8]}"
+    input_dir = tmp_path / workspace
+    input_dir.mkdir()
+    file_path = input_dir / "already-parsed.docx"
     file_path.write_bytes(b"docx bytes")
-    parsed_dir = tmp_path / PARSED_DIR_NAME
+    parsed_dir = input_dir / PARSED_DIR_NAME
     parsed_dir.mkdir()
     (parsed_dir / file_path.name).write_bytes(b"previous parsed file")
     doc_manager = DocumentManager(str(tmp_path))
@@ -804,7 +810,8 @@ async def test_scan_processed_same_name_archives_with_unique_name(
                 "file_path": str(file_path),
                 "track_id": "track-existing",
             }
-        }
+        },
+        workspace=workspace,
     )
 
     async def fail_if_reenqueue(*args, **kwargs):
@@ -824,7 +831,10 @@ async def test_scan_processed_same_name_archives_with_unique_name(
 async def test_scan_processed_canonical_name_archives_hinted_file(
     tmp_path, monkeypatch
 ):
-    file_path = tmp_path / "already-parsed.[native].docx"
+    workspace = f"scan-ws-{uuid4().hex[:8]}"
+    input_dir = tmp_path / workspace
+    input_dir.mkdir()
+    file_path = input_dir / "already-parsed.[native].docx"
     file_path.write_bytes(b"docx bytes")
     doc_manager = DocumentManager(str(tmp_path))
     rag = _ScanRag(
@@ -834,7 +844,8 @@ async def test_scan_processed_canonical_name_archives_hinted_file(
                 "file_path": "already-parsed.docx",
                 "track_id": "track-existing",
             }
-        }
+        },
+        workspace=workspace,
     )
 
     async def fail_if_reenqueue(*args, **kwargs):
@@ -847,16 +858,19 @@ async def test_scan_processed_canonical_name_archives_hinted_file(
     await run_scanning_process(rag, doc_manager, "track-scan")
 
     assert not file_path.exists()
-    assert (tmp_path / PARSED_DIR_NAME / file_path.name).read_bytes() == b"docx bytes"
+    assert (input_dir / PARSED_DIR_NAME / file_path.name).read_bytes() == b"docx bytes"
 
 
 async def test_scan_archives_scan_wide_canonical_duplicates(tmp_path, monkeypatch):
-    plain_file = tmp_path / "same.docx"
-    hinted_file = tmp_path / "same.[native].docx"
+    workspace = f"scan-ws-{uuid4().hex[:8]}"
+    input_dir = tmp_path / workspace
+    input_dir.mkdir()
+    plain_file = input_dir / "same.docx"
+    hinted_file = input_dir / "same.[native].docx"
     plain_file.write_bytes(b"plain docx bytes")
     hinted_file.write_bytes(b"hinted docx bytes")
     doc_manager = DocumentManager(str(tmp_path))
-    rag = _ScanRag({})
+    rag = _ScanRag({}, workspace=workspace)
     calls = []
 
     async def capture_pipeline(rag_arg, candidates, track_id, **kwargs):
@@ -889,7 +903,7 @@ async def test_scan_archives_scan_wide_canonical_duplicates(tmp_path, monkeypatc
     # caller — so the batch call carries no extra keyword.
     assert calls[0]["kwargs"] == {}
     archived_names = {
-        path.name for path in (tmp_path / PARSED_DIR_NAME).iterdir() if path.is_file()
+        path.name for path in (input_dir / PARSED_DIR_NAME).iterdir() if path.is_file()
     }
     assert archived_names == {loser.name}
     assert winner.exists()
@@ -898,10 +912,13 @@ async def test_scan_archives_scan_wide_canonical_duplicates(tmp_path, monkeypatc
 
 async def test_scan_rejects_invalid_filename_hint(tmp_path, monkeypatch):
     monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
-    file_path = tmp_path / "bad-scan.[native-FR].docx"
+    workspace = f"scan-ws-{uuid4().hex[:8]}"
+    input_dir = tmp_path / workspace
+    input_dir.mkdir()
+    file_path = input_dir / "bad-scan.[native-FR].docx"
     file_path.write_bytes(b"docx bytes")
     doc_manager = DocumentManager(str(tmp_path))
-    rag = _ScanRag({})
+    rag = _ScanRag({}, workspace=workspace)
 
     await run_scanning_process(rag, doc_manager, "track-scan")
 
@@ -923,7 +940,10 @@ async def test_scan_rejects_invalid_filename_hint(tmp_path, monkeypatch):
 
 
 async def test_scan_existing_non_processed_reprocesses_file(tmp_path, monkeypatch):
-    file_path = tmp_path / "retry.docx"
+    workspace = f"scan-ws-{uuid4().hex[:8]}"
+    input_dir = tmp_path / workspace
+    input_dir.mkdir()
+    file_path = input_dir / "retry.docx"
     file_path.write_bytes(b"docx bytes")
     doc_manager = DocumentManager(str(tmp_path))
     rag = _ScanRag(
@@ -933,7 +953,8 @@ async def test_scan_existing_non_processed_reprocesses_file(tmp_path, monkeypatc
                 "file_path": str(file_path),
                 "track_id": "track-existing",
             }
-        }
+        },
+        workspace=workspace,
     )
     calls = []
 
@@ -979,8 +1000,11 @@ async def test_scan_mixed_new_and_resume_routes_only_new_through_enqueue(
     successfully enqueues.  Without the unconditional trigger, an all-
     failed batch of new files would silently strand the resume rows.
     """
-    new_file = tmp_path / "fresh.docx"
-    resume_file = tmp_path / "retry.docx"
+    workspace = f"scan-ws-{uuid4().hex[:8]}"
+    input_dir = tmp_path / workspace
+    input_dir.mkdir()
+    new_file = input_dir / "fresh.docx"
+    resume_file = input_dir / "retry.docx"
     new_file.write_bytes(b"fresh docx bytes")
     resume_file.write_bytes(b"retry docx bytes")
     doc_manager = DocumentManager(str(tmp_path))
@@ -991,7 +1015,8 @@ async def test_scan_mixed_new_and_resume_routes_only_new_through_enqueue(
                 "file_path": str(resume_file),
                 "track_id": "track-existing",
             }
-        }
+        },
+        workspace=workspace,
     )
     calls = []
 
@@ -1038,7 +1063,10 @@ async def test_scan_failed_extraction_record_without_full_docs_is_retried(
     file and re-scans we must drop the stale stub and route the file
     through the normal new-file enqueue, otherwise the fix never lands.
     """
-    file_path = tmp_path / "fixed.docx"
+    workspace = f"scan-ws-{uuid4().hex[:8]}"
+    input_dir = tmp_path / workspace
+    input_dir.mkdir()
+    file_path = input_dir / "fixed.docx"
     file_path.write_bytes(b"now-readable bytes")
     doc_manager = DocumentManager(str(tmp_path))
     rag = _ScanRag(
@@ -1051,6 +1079,7 @@ async def test_scan_failed_extraction_record_without_full_docs_is_retried(
             }
         },
         full_docs_by_id={},  # Extraction error: no full_docs entry was ever written.
+        workspace=workspace,
     )
     calls = []
 
@@ -1090,7 +1119,10 @@ async def test_scan_failed_with_full_docs_resumes_normally(tmp_path, monkeypatch
     failure after content was successfully stored; the pipeline's resume
     logic resets it to PENDING and replays.  The scan must not delete it.
     """
-    file_path = tmp_path / "downstream-failed.docx"
+    workspace = f"scan-ws-{uuid4().hex[:8]}"
+    input_dir = tmp_path / workspace
+    input_dir.mkdir()
+    file_path = input_dir / "downstream-failed.docx"
     file_path.write_bytes(b"docx bytes")
     doc_manager = DocumentManager(str(tmp_path))
     rag = _ScanRag(
@@ -1100,8 +1132,9 @@ async def test_scan_failed_with_full_docs_resumes_normally(tmp_path, monkeypatch
                 "file_path": str(file_path),
                 "track_id": "track-old",
             }
-        }
+        },
         # full_docs default-seeded for the path → resumable FAILED.
+        workspace=workspace,
     )
     calls = []
 
@@ -1134,8 +1167,11 @@ async def test_scan_resume_runs_when_all_new_files_fail_to_enqueue(
     that records its invocation but does not call process_enqueue (mirroring
     the real helper's behaviour when every per-file enqueue returns False).
     """
-    new_file = tmp_path / "fresh.docx"
-    resume_file = tmp_path / "retry.docx"
+    workspace = f"scan-ws-{uuid4().hex[:8]}"
+    input_dir = tmp_path / workspace
+    input_dir.mkdir()
+    new_file = input_dir / "fresh.docx"
+    resume_file = input_dir / "retry.docx"
     new_file.write_bytes(b"fresh docx bytes")
     resume_file.write_bytes(b"retry docx bytes")
     doc_manager = DocumentManager(str(tmp_path))
@@ -1146,7 +1182,8 @@ async def test_scan_resume_runs_when_all_new_files_fail_to_enqueue(
                 "file_path": str(resume_file),
                 "track_id": "track-existing",
             }
-        }
+        },
+        workspace=workspace,
     )
 
     async def index_files_all_rejected(rag_arg, candidates, track_id, **kwargs):
@@ -1212,9 +1249,12 @@ async def test_upload_rejects_parser_hinted_filesystem_duplicate(tmp_path, monke
     monkeypatch.setattr(
         _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
     )
-    (tmp_path / "existing.docx").write_bytes(b"existing docx bytes")
+    workspace = f"upload-ws-{uuid4().hex[:8]}"
+    input_dir = tmp_path / workspace
+    input_dir.mkdir()
+    (input_dir / "existing.docx").write_bytes(b"existing docx bytes")
     doc_manager = DocumentManager(str(tmp_path))
-    rag = _DuplicateUploadRag({})
+    rag = _DuplicateUploadRag({}, workspace=workspace)
     router = create_document_routes(rag, doc_manager)
     upload_endpoint = [
         route.endpoint
@@ -1232,7 +1272,7 @@ async def test_upload_rejects_parser_hinted_filesystem_duplicate(tmp_path, monke
         await upload_endpoint(set(), upload_file)
     assert excinfo.value.status_code == 409
     assert "existing.docx" in excinfo.value.detail
-    assert not (tmp_path / "existing.[native].docx").exists()
+    assert not (input_dir / "existing.[native].docx").exists()
 
 
 async def test_upload_opener_construction_failure_returns_500_not_409(
@@ -1394,7 +1434,7 @@ async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypat
         _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
     )
     doc_manager = DocumentManager(str(tmp_path))
-    rag = _DuplicateUploadRag({})
+    rag = _DuplicateUploadRag({}, workspace=f"upload-ws-{uuid4().hex[:8]}")
 
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
@@ -1435,7 +1475,7 @@ async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypat
 
     # Endpoint accepted the upload despite busy=True.
     assert response.status == "success"
-    assert (tmp_path / "while_busy.docx").exists()
+    assert (tmp_path / rag.workspace / "while_busy.docx").exists()
     # The slot has been transferred to the managed task, which is parked in the
     # gated child; until it finishes pending_enqueues stays at 1 so a concurrent
     # /scan would refuse.
@@ -1540,7 +1580,7 @@ async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatc
         _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
     )
     doc_manager = DocumentManager(str(tmp_path))
-    rag = _DuplicateUploadRag({})
+    rag = _DuplicateUploadRag({}, workspace=f"upload-ws-{uuid4().hex[:8]}")
 
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
@@ -1580,7 +1620,7 @@ async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatc
 
     # Endpoint accepted the upload despite scan in progress.
     assert response.status == "success"
-    assert (tmp_path / "upload_during_scan_processing.docx").exists()
+    assert (tmp_path / rag.workspace / "upload_during_scan_processing.docx").exists()
     assert pipeline_status["pending_enqueues"] == 1
     assert len(managed) == 1
 
@@ -2480,7 +2520,7 @@ async def test_two_concurrent_uploads_both_succeed_when_pipeline_busy(
         _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
     )
     doc_manager = DocumentManager(str(tmp_path))
-    rag = _DuplicateUploadRag({})
+    rag = _DuplicateUploadRag({}, workspace=f"upload-ws-{uuid4().hex[:8]}")
 
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
@@ -2523,8 +2563,8 @@ async def test_two_concurrent_uploads_both_succeed_when_pipeline_busy(
     # Both reservations coexist while the gated managed tasks run.
     assert pipeline_status["pending_enqueues"] == 2
     # Both files were written to disk; both managed tasks tracked.
-    assert (tmp_path / "a.docx").exists()
-    assert (tmp_path / "b.docx").exists()
+    assert (tmp_path / rag.workspace / "a.docx").exists()
+    assert (tmp_path / rag.workspace / "b.docx").exists()
     assert len(managed) == 2
 
     # Let both finish; each child's finally releases its slot.

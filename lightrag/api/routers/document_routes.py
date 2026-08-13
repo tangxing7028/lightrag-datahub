@@ -1599,7 +1599,7 @@ class DocumentManager:
             if engine_endpoint_configured(engine)
         }
 
-    def iter_new_files(self) -> Iterator[Path]:
+    def iter_new_files(self, input_dir: Path | None = None) -> Iterator[Path]:
         """Yield new, routable input files ONE AT A TIME (LR2 §8.2).
 
         A single streaming pass: one ``scandir()`` over the input directory, no
@@ -1610,6 +1610,11 @@ class DocumentManager:
         entry name before yielding the first one. An interrupted scan needs no
         in-memory resume state — the next scan re-discovers, and the persistent
         ``doc_status`` rows are the deduplication authority.
+
+        ``input_dir`` overrides the directory to scan; ``None`` (default) scans
+        ``self.input_dir``. The scan endpoint passes the request workspace's
+        directory (see ``workspace_input_dir``) so a ``LIGHTRAG-WORKSPACE``
+        header-selected scan reads that workspace's drop folder.
 
         Files are admitted on the *available* engine suffix surface (so a
         hint-carrying file like ``img.[mineru].png`` is discoverable even when
@@ -1625,9 +1630,10 @@ class DocumentManager:
         from lightrag.parser.registry import available_engine_suffixes
         from lightrag.parser.routing import FilenameParserHintError
 
+        scan_dir = input_dir if input_dir is not None else self.input_dir
         suffixes = {f".{s}" for s in available_engine_suffixes()}
-        logger.debug(f"Streaming scan of {self.input_dir} for {len(suffixes)} suffixes")
-        with os.scandir(self.input_dir) as entries:
+        logger.debug(f"Streaming scan of {scan_dir} for {len(suffixes)} suffixes")
+        with os.scandir(scan_dir) as entries:
             for entry in entries:
                 file_path = Path(entry.path)
                 # Suffix comparison is case-sensitive, matching the per-suffix glob
@@ -3879,7 +3885,17 @@ async def run_scanning_process(
         with _ScanCandidateSpool(
             batch_size, _scan_spool_base_dir(rag)
         ) as candidate_spool:
-            for file_path in doc_manager.iter_new_files():
+            # Scan the input directory of the workspace this request resolved
+            # to (LIGHTRAG-WORKSPACE header), not necessarily the startup
+            # workspace's directory doc_manager is bound to — same resolution
+            # as /documents/clear. No header -> the default directory, the
+            # historical behavior. A lazily-created workspace's directory may
+            # not exist yet; creating it is the idempotent no-op case.
+            effective_input_dir = workspace_input_dir(
+                doc_manager, getattr(rag, "workspace", "")
+            )
+            effective_input_dir.mkdir(parents=True, exist_ok=True)
+            for file_path in doc_manager.iter_new_files(effective_input_dir):
                 discovered += 1
                 # Classifying a large tree can outlast the job lease; renewing here
                 # (time-based, a no-op most iterations) keeps the record from being
@@ -5252,8 +5268,20 @@ def create_document_routes(
             if not admission_adopted:
                 await _reserve_enqueue_slot(rag, enqueue_token)
 
+            # Land the upload in the input directory of the workspace this
+            # request resolved to (LIGHTRAG-WORKSPACE header), not necessarily
+            # the startup workspace's directory doc_manager is bound to — same
+            # resolution as /documents/clear and /documents/scan. No header ->
+            # the default directory, the historical behavior. A lazily-created
+            # workspace's directory may not exist yet; create it up front so
+            # the same-name checks and the streaming write below share one root.
+            effective_input_dir = workspace_input_dir(
+                doc_manager, getattr(rag, "workspace", "")
+            )
+            effective_input_dir.mkdir(parents=True, exist_ok=True)
+
             # Sanitize filename to prevent Path Traversal attacks
-            safe_filename = sanitize_filename(file.filename, doc_manager.input_dir)
+            safe_filename = sanitize_filename(file.filename, effective_input_dir)
 
             try:
                 filename_supported = doc_manager.is_supported_file(safe_filename)
@@ -5289,7 +5317,7 @@ def create_document_routes(
                         f"File size not available in UploadFile for {safe_filename}, will check during streaming"
                     )
 
-            file_path = doc_manager.input_dir / safe_filename
+            file_path = effective_input_dir / safe_filename
 
             # Strict name pre-check.  Both the INPUT directory and doc_status
             # must be free of any same-canonical-basename record before we
@@ -5316,7 +5344,7 @@ def create_document_routes(
                 existing_input_file: Path | None = file_path
             else:
                 existing_input_file = find_existing_file_by_file_path(
-                    doc_manager.input_dir, canonical_filename
+                    effective_input_dir, canonical_filename
                 )
             if existing_input_file:
                 raise HTTPException(
@@ -5383,7 +5411,7 @@ def create_document_routes(
                         # here must not block the accepted retry.
                         stale_path = deletion.file_path or retry_file_path
                         _, stale_errors = delete_file_variants_by_file_path(
-                            doc_manager.input_dir, stale_path
+                            effective_input_dir, stale_path
                         )
                         for stale_error in stale_errors:
                             logger.warning(
@@ -5399,7 +5427,7 @@ def create_document_routes(
             chunk_size = 1024 * 1024  # 1MB chunks
             needs_cleanup = False
 
-            upload_opener = upload_file_opener(doc_manager.input_dir)
+            upload_opener = upload_file_opener(effective_input_dir)
             out_file_context = aiofiles.open(file_path, "xb", opener=upload_opener)
 
             opened = False

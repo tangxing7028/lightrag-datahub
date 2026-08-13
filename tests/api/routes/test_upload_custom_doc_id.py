@@ -135,8 +135,8 @@ async def test_upload_with_custom_doc_id_forwards_ids_override(tmp_path, monkeyp
         _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
     )
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    doc_manager = DocumentManager(str(tmp_path))
     rag = _UploadRag()
+    doc_manager = DocumentManager(str(tmp_path), workspace=rag.workspace)
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
     endpoint = _upload_endpoint(rag, doc_manager)
 
@@ -148,7 +148,7 @@ async def test_upload_with_custom_doc_id_forwards_ids_override(tmp_path, monkeyp
     await _await_managed(managed)
 
     assert response.status == "success"
-    assert (tmp_path / "report.md").exists()
+    assert (doc_manager.input_dir / "report.md").exists()
     assert len(rag.enqueued) == 1
     enqueued = rag.enqueued[0]
     assert enqueued["ids"] == ["8012345678901234567890"]
@@ -165,8 +165,8 @@ async def test_upload_without_doc_id_passes_no_ids(tmp_path, monkeypatch):
         _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
     )
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    doc_manager = DocumentManager(str(tmp_path))
     rag = _UploadRag()
+    doc_manager = DocumentManager(str(tmp_path), workspace=rag.workspace)
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
     endpoint = _upload_endpoint(rag, doc_manager)
 
@@ -201,8 +201,8 @@ async def test_upload_rejects_invalid_doc_id_before_writing(
         _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
     )
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    doc_manager = DocumentManager(str(tmp_path))
     rag = _UploadRag()
+    doc_manager = DocumentManager(str(tmp_path), workspace=rag.workspace)
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
     endpoint = _upload_endpoint(rag, doc_manager)
 
@@ -222,7 +222,6 @@ async def test_upload_conflicting_live_doc_id_returns_409(tmp_path, monkeypatch)
         _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
     )
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    doc_manager = DocumentManager(str(tmp_path))
     rag = _UploadRag(
         {
             "8012345678901234567890": {
@@ -231,6 +230,7 @@ async def test_upload_conflicting_live_doc_id_returns_409(tmp_path, monkeypatch)
             }
         }
     )
+    doc_manager = DocumentManager(str(tmp_path), workspace=rag.workspace)
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
     endpoint = _upload_endpoint(rag, doc_manager)
 
@@ -258,7 +258,6 @@ async def test_upload_failed_doc_id_is_retired_then_reuploaded(
         _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
     )
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    doc_manager = DocumentManager(str(tmp_path))
     rag = _UploadRag(
         {
             "8012345678901234567890": {
@@ -267,6 +266,7 @@ async def test_upload_failed_doc_id_is_retired_then_reuploaded(
             }
         }
     )
+    doc_manager = DocumentManager(str(tmp_path), workspace=rag.workspace)
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
     endpoint = _upload_endpoint(rag, doc_manager)
 
@@ -293,7 +293,6 @@ async def test_upload_failed_doc_id_retire_refused_when_delete_not_allowed(
         _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
     )
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    doc_manager = DocumentManager(str(tmp_path))
     rag = _UploadRag(
         {
             "8012345678901234567890": {
@@ -303,6 +302,7 @@ async def test_upload_failed_doc_id_retire_refused_when_delete_not_allowed(
         },
         delete_status="not_allowed",
     )
+    doc_manager = DocumentManager(str(tmp_path), workspace=rag.workspace)
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
     endpoint = _upload_endpoint(rag, doc_manager)
 

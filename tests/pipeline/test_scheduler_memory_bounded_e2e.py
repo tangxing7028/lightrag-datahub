@@ -478,15 +478,17 @@ async def _run_scan_rss(total: int, input_dir: str) -> dict[str, int]:
 
     directory = Path(input_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    # Real directory entries, created before the baseline so the test measures
-    # discovery/classification/enqueue rather than fixture construction.
-    for index in range(total):
-        (directory / f"rss-{index:09d}-{'x' * 80}.txt").touch()
 
     rag = _ScanRag()
     initialize_share_data()
     await initialize_pipeline_status(workspace=rag.workspace)
-    manager = routes.DocumentManager(str(directory))
+    manager = routes.DocumentManager(str(directory), workspace=rag.workspace)
+    # Real directory entries, created before the baseline so the test measures
+    # discovery/classification/enqueue rather than fixture construction. They
+    # land in the workspace's own input directory, which is what the scan now
+    # discovers (header-workspace routing, ④f).
+    for index in range(total):
+        (manager.input_dir / f"rss-{index:09d}-{'x' * 80}.txt").touch()
     router = routes.create_document_routes(rag, manager)
     scan_endpoint = [
         route.endpoint
