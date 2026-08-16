@@ -229,6 +229,11 @@ class MinerUParserOptions:
             ).strip()
             or DEFAULT_MINERU_LANGUAGE
         )
+        requested_parse_method = (
+            str(overrides.get("parse_method", "")).strip().lower()
+            if "parse_method" in overrides
+            else ""
+        )
         local_parse_method = (
             str(
                 overrides.get(
@@ -239,6 +244,17 @@ class MinerUParserOptions:
                 )
             ).strip()
             or DEFAULT_MINERU_LOCAL_PARSE_METHOD
+        )
+        if requested_parse_method:
+            local_parse_method = requested_parse_method
+        # The official API has no local form field, but it does expose the
+        # same OCR intent through ``is_ocr``.  Wrapper/local modes also use
+        # the explicit parse method below, so one upload contract has the
+        # same meaning across all MinerU backends.
+        is_ocr = (
+            requested_parse_method == "ocr"
+            if requested_parse_method
+            else _env_bool("MINERU_IS_OCR", DEFAULT_MINERU_IS_OCR)
         )
         local_start = _env_int(
             "MINERU_LOCAL_START_PAGE_ID", DEFAULT_MINERU_LOCAL_START_PAGE_ID
@@ -259,7 +275,7 @@ class MinerUParserOptions:
             enable_formula=_env_bool(
                 "MINERU_ENABLE_FORMULA", DEFAULT_MINERU_ENABLE_FORMULA
             ),
-            is_ocr=_env_bool("MINERU_IS_OCR", DEFAULT_MINERU_IS_OCR),
+            is_ocr=is_ocr,
             page_ranges=page_ranges,
             local_backend=(
                 os.getenv("MINERU_LOCAL_BACKEND", DEFAULT_MINERU_LOCAL_BACKEND).strip()

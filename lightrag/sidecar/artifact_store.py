@@ -170,16 +170,21 @@ def config_from_env(
 def render_artifact_template(
     template: str, *, workspace: str, doc_id: str, relpath: str = ""
 ) -> str:
-    """Substitute ``{workspace}`` / ``{doc_id}`` / ``{relpath}`` tokens.
+    """Substitute workspace, KB, document and relative-path tokens.
 
     Plain ``str.replace`` (not ``str.format``) so templates containing other
     braces — e.g. a URL query string — never raise; unknown tokens pass
     through unchanged.
     """
+    kb_id = workspace[3:] if workspace.startswith("kb_") else workspace
     return (
         template.replace("{workspace}", workspace)
+        .replace("{kb_id}", kb_id)
         .replace("{doc_id}", doc_id)
         .replace("{relpath}", relpath)
+        # ``artifact_path`` is the DataHub browser-proxy spelling. Keep
+        # ``relpath`` as the native fork spelling for existing deployments.
+        .replace("{artifact_path}", relpath)
     )
 
 

@@ -5489,6 +5489,14 @@ class _PipelineMixin:
                     )
 
                     process_end_time = int(time.time())
+                    # Publish user-visible artifacts before PROCESSED. A
+                    # configured artifact store is part of the read contract;
+                    # an export failure must remain visible as ingest failure.
+                    await self._export_processed_doc_artifacts(
+                        doc_id=doc_id,
+                        chunk_ids=list(chunks.keys()),
+                        file_path=file_path,
+                    )
                     await self._upsert_doc_status_transition(
                         ctx=ctx,
                         doc_id=doc_id,
@@ -5530,19 +5538,6 @@ class _PipelineMixin:
                         logger.info(log_message)
                         ctx.pipeline_status["latest_message"] = log_message
                         append_pipeline_history(ctx.pipeline_status, log_message)
-
-                    # Artifact export (object storage, env-gated): publish the
-                    # final full_docs body (document.md — already carrying the
-                    # rewritten drawing URLs) and the chunk inventory
-                    # (chunks.json) next to the assets uploaded before
-                    # chunking. Best-effort: a failure is logged as a warning
-                    # and never affects the PROCESSED outcome; a rerun of the
-                    # document re-exports.
-                    await self._export_processed_doc_artifacts(
-                        doc_id=doc_id,
-                        chunk_ids=list(chunks.keys()),
-                        file_path=file_path,
-                    )
 
                 except Exception as e:
                     # A storage flush failure (raised by _insert_done) is not
@@ -6222,9 +6217,9 @@ class _PipelineMixin:
         ``[{chunk_id, chunk_order_index, tokens, content}]`` sorted by
         ``chunk_order_index``, read back from ``text_chunks`` via the
         doc_status chunk-id list. Both land under the same object-key prefix
-        as the assets staged before chunking. Best-effort by contract: any
-        failure is a warning, never a pipeline failure — a document rerun
-        re-exports.
+        as the assets staged before chunking. When artifact storage is
+        configured, failures are raised so the caller can expose an unusable
+        artifact as an ingest failure instead of claiming full success.
         """
         store = get_artifact_store()
         if store is None:
@@ -6266,10 +6261,8 @@ class _PipelineMixin:
                 f"chunks.json ({len(items)} chunk(s))"
             )
         except Exception as exc:
-            logger.warning(
-                f"[artifacts] export failed for {doc_id} ({file_path}); "
-                f"the document stays PROCESSED and a rerun re-exports: {exc}"
-            )
+            logger.error(f"[artifacts] export failed for {doc_id} ({file_path}): {exc}")
+            raise
 
     async def _mark_duplicate_after_parse(
         self,

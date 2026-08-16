@@ -103,14 +103,14 @@ def test_config_parses_defaults_and_overrides():
 
 def test_render_artifact_template_substitutes_known_tokens_only():
     rendered = render_artifact_template(
-        "https://h/x?workspace={workspace}&doc_id={doc_id}&path={relpath}&keep={other}",
-        workspace="ws_1",
+        "https://h/x?workspace={workspace}&kb={kb_id}&doc_id={doc_id}&path={relpath}&artifact={artifact_path}&keep={other}",
+        workspace="kb_42",
         doc_id="doc-9",
         relpath="a.blocks.assets/i.png",
     )
     assert rendered == (
-        "https://h/x?workspace=ws_1&doc_id=doc-9"
-        "&path=a.blocks.assets/i.png&keep={other}"
+        "https://h/x?workspace=kb_42&kb=42&doc_id=doc-9"
+        "&path=a.blocks.assets/i.png&artifact=a.blocks.assets/i.png&keep={other}"
     )
 
 

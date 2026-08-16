@@ -109,10 +109,12 @@ from lightrag.parser.routing import (
     canonicalize_parser_hinted_basename,
     chunk_strategy_key,
     encode_parse_engine,
+    normalize_parser_engine,
     parse_process_options,
     resolve_chunk_options,
     resolve_parser_directives,
 )
+from lightrag.parser.registry import supported_parser_engines
 from lightrag.utils import (
     generate_track_id,
     move_file_to_parsed_dir,
@@ -319,6 +321,84 @@ def sanitize_filename(filename: str, input_dir: Path) -> str:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
     return filename
+
+
+def _form_bool(value: str | None, default: bool) -> bool:
+    """Parse the upload contract's string booleans without truthiness traps."""
+    # Direct callers of the generated FastAPI endpoint (including internal
+    # tests) may observe the ``Form(None)`` marker as the Python default
+    # instead of a parsed request value. Treat that marker exactly like an
+    # omitted optional field rather than converting its repr to text.
+    if value is None or not isinstance(value, (str, bool, int, float)):
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise HTTPException(status_code=400, detail=f"布尔参数格式无效: {value!r}")
+
+
+def _upload_filename_with_directives(
+    filename: str,
+    *,
+    parser: str | None,
+    parse_method: str | None,
+    enable_image: str | None,
+    enable_table: str | None,
+    enable_equation: str | None,
+    skip_entity_extract: str | None,
+) -> str:
+    """Encode DataHub's per-document parse contract into native file hints.
+
+    The fork already persists and executes parser/process directives from the
+    ``.[engine-options].ext`` filename syntax.  Translating the multipart
+    fields here keeps the official pipeline as the single execution path and
+    avoids a second, fork-specific parser implementation.
+    """
+    if not isinstance(parser, str) or not parser.strip():
+        return filename
+    engine = normalize_parser_engine(parser)
+    if engine not in supported_parser_engines():
+        raise HTTPException(status_code=400, detail=f"不支持的解析器: {parser}")
+    method = (parse_method or "auto").strip().lower()
+    if method not in {"auto", "ocr", "txt"}:
+        raise HTTPException(status_code=400, detail=f"不支持的解析模式: {method}")
+
+    options = "".join(
+        flag
+        for flag, raw, default in (
+            ("i", enable_image, True),
+            ("t", enable_table, True),
+            ("e", enable_equation, True),
+            ("!", skip_entity_extract, False),
+        )
+        if _form_bool(raw, default)
+    )
+    engine_token = engine
+    if engine == "mineru" and method != "auto":
+        engine_token += f"(parse_method={method})"
+    if options:
+        engine_token += f"-{options}"
+
+    source = Path(filename).name
+    suffix = Path(source).suffix
+    if not suffix:
+        raise HTTPException(status_code=400, detail="上传文件缺少可识别的扩展名")
+    return f"{source[: -len(suffix)]}.[{engine_token}]{suffix}"
+
+
+def _parse_upload_chunking(value: str | None) -> "TextChunkingConfig | None":
+    """Decode the JSON multipart chunking contract before enqueueing bytes."""
+    if value is None or not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        raw = json.loads(value)
+        if not isinstance(raw, dict):
+            raise ValueError("chunking 必须是 JSON 对象")
+        return TextChunkingConfig.model_validate(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"切块配置无效: {exc}") from exc
 
 
 _UPLOAD_DIR_FD_SUPPORTED = os.open in os.supports_dir_fd
@@ -2405,6 +2485,7 @@ async def pipeline_enqueue_file(
     admission_token: str | None = None,
     known_file_size: int | None = None,
     doc_id: str | None = None,
+    chunking: "TextChunkingConfig | None" = None,
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -2493,18 +2574,16 @@ async def pipeline_enqueue_file(
         # parse worker chunks this document with them. Absent params keep the
         # legacy path (chunk_options built at enqueue time from addon_params).
         hint_chunk_options = None
-        active_strategy = parse_process_options(api_process_options).chunking
-        hint_chunk_params = directives.chunk_params.get(active_strategy)
-        if hint_chunk_params:
+        if chunking is not None:
             try:
-                strategy_key = chunk_strategy_key(api_process_options)
-                hint_chunk_options = resolve_chunk_options(
-                    rag.addon_params, process_options=api_process_options
+                chunk_process_options, hint_chunk_options = _resolve_text_chunking(chunking, rag)
+                directive_flags = parse_process_options(process_options)
+                media_options = "".join(
+                    flag for flag, enabled in (("i", directive_flags.images), ("t", directive_flags.tables),
+                                               ("e", directive_flags.equations), ("!", directive_flags.skip_kg))
+                    if enabled
                 )
-                hint_chunk_options[strategy_key].update(hint_chunk_params)
-                _validate_effective_chunk_overlap(
-                    hint_chunk_options, strategy_key, strategy_key
-                )
+                api_process_options = media_options + chunk_process_options
             except ValueError as e:
                 error_files = [
                     {
@@ -2521,6 +2600,32 @@ async def pipeline_enqueue_file(
                     f"{file_path.name}: {e}"
                 )
                 return False, track_id
+        else:
+            active_strategy = parse_process_options(api_process_options).chunking
+            hint_chunk_params = directives.chunk_params.get(active_strategy)
+            if hint_chunk_params:
+                try:
+                    strategy_key = chunk_strategy_key(api_process_options)
+                    hint_chunk_options = resolve_chunk_options(
+                        rag.addon_params, process_options=api_process_options
+                    )
+                    hint_chunk_options[strategy_key].update(hint_chunk_params)
+                    _validate_effective_chunk_overlap(
+                        hint_chunk_options, strategy_key, strategy_key
+                    )
+                except ValueError as e:
+                    error_files = [
+                        {
+                            "file_path": str(file_path.name),
+                            "error_description": FILE_EXTRACTION_SUMMARY_PREFIX
+                            + "Chunk parameter error",
+                            "original_error": str(e),
+                            "file_size": file_size,
+                        }
+                    ]
+                    await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                    logger.error(f"[File Extraction]Invalid chunk parameters in {file_path.name}: {e}")
+                    return False, track_id
         # All engines defer parsing to the worker stage: the file is already
         # saved on disk, so we enqueue PENDING_PARSE with the chosen engine.
         # Legacy now extracts at the worker (LegacyParser) instead of eagerly
@@ -2612,6 +2717,7 @@ async def pipeline_index_file(
     track_id: str = None,
     admission_token: str | None = None,
     doc_id: str | None = None,
+    chunking: "TextChunkingConfig | None" = None,
 ):
     """Index a file with track_id
 
@@ -2624,10 +2730,17 @@ async def pipeline_index_file(
             instead of counting this request twice (LR2 §9.2)
         doc_id: optional caller-assigned document id, forwarded to
             ``pipeline_enqueue_file`` (upload path only)
+        chunking: optional validated per-document chunking configuration,
+            forwarded unchanged to ``pipeline_enqueue_file``
     """
     try:
         success, _ = await pipeline_enqueue_file(
-            rag, file_path, track_id, admission_token=admission_token, doc_id=doc_id
+            rag,
+            file_path,
+            track_id,
+            admission_token=admission_token,
+            doc_id=doc_id,
+            chunking=chunking,
         )
         if success:
             await rag.apipeline_process_enqueue_documents()
@@ -5166,6 +5279,14 @@ def create_document_routes(
         managed_tasks: set = Depends(get_managed_background_tasks),
         file: UploadFile = File(...),
         doc_id: Optional[str] = Form(None),
+        parser: Optional[str] = Form(None),
+        parse_method: Optional[str] = Form(None),
+        enable_image: Optional[str] = Form(None),
+        enable_table: Optional[str] = Form(None),
+        enable_equation: Optional[str] = Form(None),
+        skip_entity_extract: Optional[str] = Form(None),
+        embedding_dim: Optional[int] = Form(None),
+        chunking: Optional[str] = Form(None),
         http_request: Request = None,
         rag: LightRAG = resolve_request_rag,
     ):
@@ -5280,8 +5401,36 @@ def create_document_routes(
             )
             effective_input_dir.mkdir(parents=True, exist_ok=True)
 
-            # Sanitize filename to prevent Path Traversal attacks
-            safe_filename = sanitize_filename(file.filename, effective_input_dir)
+            # Sanitize the caller's display filename first, then encode the
+            # per-document DataHub parser contract as a native parser hint.
+            # The latter is still a single literal basename and therefore
+            # goes through the same traversal checks and duplicate handling.
+            display_filename = file.filename or ""
+            chunking_config = _parse_upload_chunking(chunking)
+            sanitize_filename(display_filename, effective_input_dir)
+            safe_filename = _upload_filename_with_directives(
+                display_filename,
+                parser=parser,
+                parse_method=parse_method,
+                enable_image=enable_image,
+                enable_table=enable_table,
+                enable_equation=enable_equation,
+                skip_entity_extract=skip_entity_extract,
+            )
+            safe_filename = sanitize_filename(safe_filename, effective_input_dir)
+
+            if embedding_dim is not None:
+                actual_embedding_dim = getattr(
+                    getattr(rag, "embedding_func", None), "embedding_dim", None
+                )
+                if actual_embedding_dim is not None and int(embedding_dim) != int(actual_embedding_dim):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"embedding_dim={embedding_dim} 与当前运行时向量维度 "
+                            f"{actual_embedding_dim} 不一致"
+                        ),
+                    )
 
             try:
                 filename_supported = doc_manager.is_supported_file(safe_filename)
@@ -5520,6 +5669,7 @@ def create_document_routes(
                         track_id,
                         admission_token=enqueue_token,
                         doc_id=requested_doc_id,
+                        chunking=chunking_config,
                     )
                 finally:
                     await _release_enqueue_slot(rag, enqueue_token)
@@ -5538,7 +5688,7 @@ def create_document_routes(
 
             return InsertResponse(
                 status="success",
-                message=f"File '{safe_filename}' uploaded successfully. Processing will continue in background.",
+                message=f"File '{display_filename}' uploaded successfully. Processing will continue in background.",
                 track_id=track_id,
             )
 
