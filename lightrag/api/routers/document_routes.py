@@ -112,6 +112,7 @@ from lightrag.parser.routing import (
     encode_parse_engine,
     normalize_parser_engine,
     parse_process_options,
+    parser_engine_supports_suffix,
     resolve_chunk_options,
     resolve_parser_directives,
 )
@@ -376,16 +377,42 @@ def _upload_filename_with_directives(
         )
         if _form_bool(raw, default)
     )
+    source = Path(filename).name
+    suffix = Path(source).suffix
+    if not suffix:
+        raise HTTPException(status_code=400, detail="上传文件缺少可识别的扩展名")
+
+    # A knowledge-base parser is a default contract, not a guarantee that the
+    # selected external engine accepts every file type the UI can upload. For
+    # example, MinerU handles PDF and images but not Markdown. Preserve the
+    # per-file processing flags while routing such local formats through the
+    # native parser first (legacy is the compatibility fallback).
+    if not parser_engine_supports_suffix(engine, suffix):
+        fallback_engine = next(
+            (
+                candidate
+                for candidate in ("native", "legacy")
+                if candidate in supported_parser_engines()
+                and parser_engine_supports_suffix(candidate, suffix)
+            ),
+            None,
+        )
+        if fallback_engine is None:
+            supported = ", ".join(sorted(supported_parser_engines()))
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"解析器 {engine} 不支持文件后缀 {suffix.lower()}，"
+                    f"当前可用解析器：{supported}"
+                ),
+            )
+        engine = fallback_engine
+
     engine_token = engine
     if engine == "mineru" and method != "auto":
         engine_token += f"(parse_method={method})"
     if options:
         engine_token += f"-{options}"
-
-    source = Path(filename).name
-    suffix = Path(source).suffix
-    if not suffix:
-        raise HTTPException(status_code=400, detail="上传文件缺少可识别的扩展名")
     return f"{source[: -len(suffix)]}.[{engine_token}]{suffix}"
 
 

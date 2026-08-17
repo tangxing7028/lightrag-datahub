@@ -20,6 +20,7 @@ _parser_routing = importlib.import_module("lightrag.parser.routing")
 sys.argv = _original_argv
 
 DocumentManager = _document_routes.DocumentManager
+upload_filename_with_directives = _document_routes._upload_filename_with_directives
 resolve_file_parser_engine = _parser_routing.resolve_file_parser_engine
 
 
@@ -46,3 +47,30 @@ def test_bare_textpack_is_supported_file_via_native(doc_manager, monkeypatch):
 def test_md_is_supported_file(doc_manager, monkeypatch):
     monkeypatch.delenv("LIGHTRAG_PARSER", raising=False)
     assert doc_manager.is_supported_file("doc.md") is True
+
+
+def test_external_parser_contract_falls_back_for_markdown():
+    """A MinerU knowledge-base contract must not produce an invalid MD hint."""
+    hinted = upload_filename_with_directives(
+        "notes.md",
+        parser="mineru",
+        parse_method="auto",
+        enable_image="true",
+        enable_table="true",
+        enable_equation="true",
+        skip_entity_extract="false",
+    )
+    assert hinted == "notes.[native-ite].md"
+
+
+def test_supported_external_suffix_keeps_selected_parser():
+    hinted = upload_filename_with_directives(
+        "contract.pdf",
+        parser="mineru",
+        parse_method="auto",
+        enable_image="true",
+        enable_table="true",
+        enable_equation="true",
+        skip_entity_extract="false",
+    )
+    assert hinted == "contract.[mineru-ite].pdf"
