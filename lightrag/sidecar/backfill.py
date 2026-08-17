@@ -72,6 +72,17 @@ def _is_unlocatable(body: str) -> bool:
     return _REPLACEMENT_CHAR in body
 
 
+def _contains_markdown_image(body: str) -> bool:
+    """True when the chunk carries markdown image syntax (``![...]``).
+
+    Artifact URL rewriting replaces parser drawing paths in the chunk source
+    after ``blocks.jsonl`` is written, so an image-bearing chunk whose span
+    cannot be relocated is a systematic rewrite artifact, not an ambiguity.
+    Callers skip provenance for it instead of failing the whole document.
+    """
+    return "![" in (body or "")
+
+
 def _load_content_blocks(blocks_path: str) -> list[tuple[str, str]]:
     """Read ``type == "content"`` rows from a blocks.jsonl file in order.
 
@@ -237,6 +248,17 @@ def backfill_chunk_sidecars(
                     f"[sidecar-backfill] chunk #{chunk.get('chunk_order_index', -1)} "
                     "contains replacement characters from a multi-byte token-boundary "
                     "split; skipping provenance for it"
+                )
+                continue
+            if _contains_markdown_image(body):
+                # Artifact URL rewriting replaces parser drawing paths in the
+                # chunk source after blocks.jsonl is written, so image-bearing
+                # chunks cannot be relocated against the verbatim blocks.
+                # Skipping provenance for them is deterministic, not a guess.
+                logger.warning(
+                    f"[sidecar-backfill] chunk #{chunk.get('chunk_order_index', -1)} "
+                    "carries markdown image paths that differ from the parsed "
+                    "blocks (rewritten asset URLs); skipping provenance for it"
                 )
                 continue
             raise ChunkBlockMatchError(

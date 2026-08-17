@@ -323,3 +323,21 @@ def test_replacement_char_chunk_skipped_not_failed(tmp_path: Path) -> None:
 
     assert "sidecar" not in chunks[0]  # provenance degraded for the corrupt chunk
     assert _refs(chunks[1]) == ["b2"]  # clean chunk still resolves
+
+
+@pytest.mark.offline
+def test_image_chunk_without_matchable_span_skips_sidecar_not_fails(
+    tmp_path: Path,
+) -> None:
+    # Artifact URL rewriting changes image paths in the chunk source after
+    # blocks.jsonl is written; an image-bearing chunk that cannot be relocated
+    # must degrade (no sidecar) instead of failing the whole document.
+    blocks_path = _write_blocks(tmp_path, [("b1", "Plain text without images.")])
+    chunks = [_span_chunk(
+        "# Heading\n\n![](images/abc.jpg)  \nimage caption",
+        7, 0, 10_000,
+    )]
+
+    backfill_chunk_sidecars(chunks, blocks_path)
+
+    assert "sidecar" not in chunks[0]
