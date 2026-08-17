@@ -83,6 +83,33 @@ def _contains_markdown_image(body: str) -> bool:
     return "![" in (body or "")
 
 
+# Markers a rewritten parser artifact leaves in chunk content after the
+# DocumentHub artifact URL rewrite runs (after blocks.jsonl is written):
+#   - "document-artifact?" / "artifact_path=" / "/api/ai/rag/kb/" - the
+#     ai-service authenticated proxy URL inserted in place of the parser path;
+#   - ".blocks.assets/" - MinerU's per-block image/table asset relative path.
+_ARTIFACT_REWRITE_MARKERS = (
+    "document-artifact?",
+    "artifact_path=",
+    "/api/ai/rag/kb/",
+    ".blocks.assets/",
+)
+
+
+def _contains_rewritten_artifact(body: str) -> bool:
+    """True when a chunk carries a rewritten artifact URL/path marker.
+
+    Artifact URL rewriting replaces parser image/table paths in the chunk
+    source after ``blocks.jsonl`` is written, so a chunk containing any such
+    rewritten marker cannot be relocated against the verbatim blocks - the
+    same deterministic rewrite artifact :func:`_contains_markdown_image`
+    covers for the markdown-image form. Skipping provenance for these keeps
+    the document from failing while never guessing provenance for a genuinely
+    ambiguous text chunk.
+    """
+    return any(marker in (body or "") for marker in _ARTIFACT_REWRITE_MARKERS)
+
+
 def _load_content_blocks(blocks_path: str) -> list[tuple[str, str]]:
     """Read ``type == "content"`` rows from a blocks.jsonl file in order.
 
@@ -250,15 +277,16 @@ def backfill_chunk_sidecars(
                     "split; skipping provenance for it"
                 )
                 continue
-            if _contains_markdown_image(body):
+            if _contains_markdown_image(body) or _contains_rewritten_artifact(body):
                 # Artifact URL rewriting replaces parser drawing paths in the
-                # chunk source after blocks.jsonl is written, so image-bearing
-                # chunks cannot be relocated against the verbatim blocks.
+                # chunk source after blocks.jsonl is written, so image/table-bearing
+                # chunks (markdown image syntax or rewritten artifact URL/path
+                # markers) cannot be relocated against the verbatim blocks.
                 # Skipping provenance for them is deterministic, not a guess.
                 logger.warning(
                     f"[sidecar-backfill] chunk #{chunk.get('chunk_order_index', -1)} "
-                    "carries markdown image paths that differ from the parsed "
-                    "blocks (rewritten asset URLs); skipping provenance for it"
+                    "carries rewritten artifact URLs that differ from the parsed "
+                    "blocks; skipping provenance for it"
                 )
                 continue
             raise ChunkBlockMatchError(
