@@ -48,16 +48,21 @@ def test_aquery_data_naive_forwards_doc_ids_and_cosine_threshold():
     async def fake_naive_query(query, chunks_vdb, param, global_config, **kwargs):
         captured["doc_ids"] = param.doc_ids
         captured["cosine_threshold"] = param.cosine_threshold
+        captured["enable_summary_search"] = param.enable_summary_search
         return None
 
     param = QueryParam(
-        mode="naive", doc_ids=["doc-1", "doc-2"], cosine_threshold=0.55
+        mode="naive",
+        doc_ids=["doc-1", "doc-2"],
+        cosine_threshold=0.55,
+        enable_summary_search=True,
     )
     with mock.patch("lightrag.lightrag.naive_query", side_effect=fake_naive_query):
         asyncio.run(rag.aquery_data("what is covered", param))
 
     assert captured["doc_ids"] == ["doc-1", "doc-2"]
     assert captured["cosine_threshold"] == 0.55
+    assert captured["enable_summary_search"] is True
 
 
 @pytest.mark.offline

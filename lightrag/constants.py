@@ -34,6 +34,11 @@ DEFAULT_SUMMARY_MAX_TOKENS = 1200
 DEFAULT_SUMMARY_LENGTH_RECOMMENDED = 600
 # Maximum token size sent to LLM for summary
 DEFAULT_SUMMARY_CONTEXT_SIZE = 12000
+# Document-level summary search (DataHub fork): characters of the parsed
+# markdown body sent to the LLM for one-per-document summary generation.
+DOC_SUMMARY_INPUT_CHAR_LIMIT = 6000
+# First-stage doc-summary retrieval fan-out before the filtered chunk search.
+DOC_SUMMARY_SEARCH_TOP_K = 3
 # Maximum token size allowed for entity extraction input context
 DEFAULT_MAX_EXTRACT_INPUT_TOKENS = 20480
 # Maximum token size for the per-chunk `---Section Context---` heading

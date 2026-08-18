@@ -851,6 +851,17 @@ def compute_mdhash_id(content: str, prefix: str = "") -> str:
     return prefix + compute_args_hash(content)
 
 
+def doc_summary_vector_id(doc_id: str) -> str:
+    """Deterministic vector row id for a document's summary.
+
+    The doc_summaries store keeps exactly one vector row per document, keyed
+    off the document id alone (not the summary text) so re-processing a
+    document overwrites its previous summary and deletion can target the row
+    without a lookup.
+    """
+    return compute_mdhash_id(f"doc-summary:{doc_id}", prefix="sum-")
+
+
 def get_unique_filename_in_parsed(target_dir: Path, original_name: str) -> str:
     """Generate a unique filename in target_dir, adding numeric suffixes on conflict.
 

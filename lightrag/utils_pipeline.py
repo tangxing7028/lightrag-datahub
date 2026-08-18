@@ -364,6 +364,10 @@ KG_RECOVERY_WARNINGS_METADATA_KEY = "kg_recovery_warnings"
 _DOC_STATUS_METADATA_CARRY_OVER_KEYS: tuple[str, ...] = (
     "process_options",
     "source_file",
+    # DataHub fork: upload-time summary opt-in (mirrors the authoritative
+    # full_docs.summary_options); must survive every stage transition so a
+    # retried document still gets its summary.
+    "enable_summary",
     "parse_warnings",
     "chunk_opts",
     "parse_start_time",
@@ -586,6 +590,9 @@ def doc_status_transition_metadata(
 _DOC_STATUS_METADATA_DIRECTIVE_KEYS: tuple[str, ...] = (
     "process_options",
     "source_file",
+    # DataHub fork: the upload-time summary opt-in rides every reset exactly
+    # like process_options — the retry must regenerate the summary too.
+    "enable_summary",
     # Defense in depth: journaled custom-chunk patch rows are excluded from
     # pipeline processing/reset entirely, but if one ever reaches a reset the
     # journal must survive — stripping it would orphan the operation's staged

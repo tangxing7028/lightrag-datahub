@@ -429,6 +429,91 @@ def _parse_upload_chunking(value: str | None) -> "TextChunkingConfig | None":
         raise HTTPException(status_code=422, detail=f"切块配置无效: {exc}") from exc
 
 
+# Keys accepted in the ``summary_model_config`` upload contract. The canonical
+# ai-service payload is ``{"model": ..., "base_url": ..., "api_key": ...}``
+# (snake_case; empty strings mean "use the workspace default"); the wider set
+# mirrors the role-LLM metadata convention (lightrag/llm_roles.py) so the
+# value can be handed to the registered role builder verbatim at process time.
+_SUMMARY_MODEL_CONFIG_KEYS = frozenset(
+    {
+        "binding",
+        "model",
+        "host",
+        "base_url",
+        "api_key",
+        "timeout",
+        "max_async",
+        "provider_options",
+    }
+)
+
+# String scalar fields; empty/blank values are dropped so the role builder's
+# fallback chain (override → role env → server default) applies per field.
+_SUMMARY_MODEL_CONFIG_STR_KEYS = frozenset(
+    {"binding", "model", "host", "base_url", "api_key"}
+)
+
+
+def _parse_summary_model_config(value: str | None) -> dict | None:
+    """Decode and validate the JSON multipart summary-model override.
+
+    Returns a plain dict in the role-metadata shape the role builder
+    understands (``base_url`` normalized onto ``host``, blank strings
+    dropped), or None when the field was omitted or carries no effective
+    override. Invalid payloads are a client error (422), mirroring the
+    ``chunking`` contract.
+    """
+    if value is None or not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        raw = json.loads(value)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422, detail=f"summary_model_config 不是合法 JSON: {exc}"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise HTTPException(
+            status_code=422, detail="summary_model_config 必须是 JSON 对象"
+        )
+    unknown = sorted(set(raw) - _SUMMARY_MODEL_CONFIG_KEYS)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"summary_model_config 包含不支持的字段: {', '.join(unknown)}",
+        )
+    for str_key in _SUMMARY_MODEL_CONFIG_STR_KEYS:
+        if raw.get(str_key) is not None and not isinstance(raw[str_key], str):
+            raise HTTPException(
+                status_code=422,
+                detail=f"summary_model_config.{str_key} 必须是字符串",
+            )
+    for int_key in ("timeout", "max_async"):
+        if raw.get(int_key) is not None and not isinstance(raw[int_key], int):
+            raise HTTPException(
+                status_code=422,
+                detail=f"summary_model_config.{int_key} 必须是整数",
+            )
+    if raw.get("provider_options") is not None and not isinstance(
+        raw["provider_options"], dict
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="summary_model_config.provider_options 必须是 JSON 对象",
+        )
+
+    normalized = {
+        key: value
+        for key, value in raw.items()
+        if not (key in _SUMMARY_MODEL_CONFIG_STR_KEYS and not str(value).strip())
+    }
+    # ai-service sends ``base_url``; the role builder metadata calls it
+    # ``host``. An explicit ``host`` wins if a client sends both.
+    base_url = normalized.pop("base_url", None)
+    if base_url and not normalized.get("host"):
+        normalized["host"] = base_url
+    return normalized or None
+
+
 _UPLOAD_DIR_FD_SUPPORTED = os.open in os.supports_dir_fd
 
 
@@ -2514,6 +2599,7 @@ async def pipeline_enqueue_file(
     known_file_size: int | None = None,
     doc_id: str | None = None,
     chunking: "TextChunkingConfig | None" = None,
+    summary_options: dict | None = None,
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -2537,6 +2623,10 @@ async def pipeline_enqueue_file(
             provided it is forwarded as the enqueue ``ids`` override so the
             pending_parse pipeline uses it as the document's full_doc_id
             instead of ``md5(canonical file_path)``.
+        summary_options: optional per-document summary contract (upload path
+            only), ``{"enable_summary": bool, "model_config": dict | None}``,
+            forwarded to the enqueue so it is persisted on ``full_docs`` and
+            read by the process-stage summary hook.
     Returns:
         tuple: (success: bool, track_id: str)
     """
@@ -2683,6 +2773,8 @@ async def pipeline_enqueue_file(
                 enqueue_kwargs["ids"] = [doc_id]
             if hint_chunk_options is not None:
                 enqueue_kwargs["chunk_options"] = hint_chunk_options
+            if summary_options is not None:
+                enqueue_kwargs["summary_options"] = summary_options
             enqueue_result = await rag.apipeline_enqueue_documents("", **enqueue_kwargs)
             if enqueue_result is None:
                 try:
@@ -2746,6 +2838,7 @@ async def pipeline_index_file(
     admission_token: str | None = None,
     doc_id: str | None = None,
     chunking: "TextChunkingConfig | None" = None,
+    summary_options: dict | None = None,
 ):
     """Index a file with track_id
 
@@ -2760,6 +2853,8 @@ async def pipeline_index_file(
             ``pipeline_enqueue_file`` (upload path only)
         chunking: optional validated per-document chunking configuration,
             forwarded unchanged to ``pipeline_enqueue_file``
+        summary_options: optional per-document summary contract, forwarded
+            unchanged to ``pipeline_enqueue_file``
     """
     try:
         success, _ = await pipeline_enqueue_file(
@@ -2769,6 +2864,7 @@ async def pipeline_index_file(
             admission_token=admission_token,
             doc_id=doc_id,
             chunking=chunking,
+            summary_options=summary_options,
         )
         if success:
             await rag.apipeline_process_enqueue_documents()
@@ -5315,6 +5411,8 @@ def create_document_routes(
         skip_entity_extract: Optional[str] = Form(None),
         embedding_dim: Optional[int] = Form(None),
         chunking: Optional[str] = Form(None),
+        enable_summary: Optional[str] = Form(None),
+        summary_model_config: Optional[str] = Form(None),
         http_request: Request = None,
         rag: LightRAG = resolve_request_rag,
     ):
@@ -5435,6 +5533,17 @@ def create_document_routes(
             # goes through the same traversal checks and duplicate handling.
             display_filename = file.filename or ""
             chunking_config = _parse_upload_chunking(chunking)
+            # Per-document summary contract (DataHub fork): enable_summary
+            # flags the doc for one-per-document LLM summary generation at
+            # process time; summary_model_config optionally overrides the LLM
+            # used for that call (ai-service 摘要场景模型).
+            summary_enabled = _form_bool(enable_summary, False)
+            summary_config = _parse_summary_model_config(summary_model_config)
+            summary_options = (
+                {"enable_summary": True, "model_config": summary_config}
+                if summary_enabled
+                else None
+            )
             sanitize_filename(display_filename, effective_input_dir)
             safe_filename = _upload_filename_with_directives(
                 display_filename,
@@ -5698,6 +5807,7 @@ def create_document_routes(
                         admission_token=enqueue_token,
                         doc_id=requested_doc_id,
                         chunking=chunking_config,
+                        summary_options=summary_options,
                     )
                 finally:
                     await _release_enqueue_slot(rag, enqueue_token)
@@ -6180,6 +6290,9 @@ def create_document_routes(
                 rag.entities_vdb,
                 rag.relationships_vdb,
                 rag.chunks_vdb,
+                # None for non-Milvus backends; dropped alongside chunks so a
+                # cleared workspace cannot serve stale doc-summary matches.
+                getattr(rag, "doc_summaries_vdb", None),
                 rag.chunk_entity_relation_graph,
                 rag.doc_status,
             ]
@@ -6189,9 +6302,13 @@ def create_document_routes(
                 pipeline_status, "Starting to drop storage components"
             )
 
-            for storage in storages:
-                if storage is not None:
-                    drop_tasks.append(storage.drop())
+            # Keep the drop tasks aligned 1:1 with the storages they came
+            # from: optional entries above (doc_summaries_vdb) may be None,
+            # and indexing ``storages[i]`` by drop-result position would
+            # misattribute (or crash on) the None slot.
+            active_storages = [storage for storage in storages if storage is not None]
+            for storage in active_storages:
+                drop_tasks.append(storage.drop())
 
             # Wait for all drop tasks to complete
             drop_results = await asyncio.gather(*drop_tasks, return_exceptions=True)
@@ -6202,7 +6319,7 @@ def create_document_routes(
             storage_error_count = 0
 
             for i, result in enumerate(drop_results):
-                storage_name = storages[i].__class__.__name__
+                storage_name = active_storages[i].__class__.__name__
                 if isinstance(result, Exception):
                     error_msg = f"Error dropping {storage_name}: {str(result)}"
                     errors.append(error_msg)
@@ -6221,8 +6338,8 @@ def create_document_routes(
                     logger.error(error_msg)
                     storage_error_count += 1
                 else:
-                    namespace = storages[i].namespace
-                    workspace = storages[i].workspace
+                    namespace = active_storages[i].namespace
+                    workspace = active_storages[i].workspace
                     logger.info(
                         f"Successfully dropped {storage_name}: {workspace}/{namespace}"
                     )

@@ -329,6 +329,24 @@ PROMPTS["fail_response"] = (
     "Sorry, I'm not able to provide an answer to that question.[no-context]"
 )
 
+PROMPTS["doc_summary"] = """---Role---
+You are a professional document analysis assistant.
+
+---Task---
+Write a concise summary of the document content provided below.
+
+---Instructions---
+1. Language & Length: the summary MUST be written in Simplified Chinese and kept within 100-200 Chinese characters.
+2. Fidelity: cover the document's main topic, key points, and conclusions. Stay strictly faithful to the source content — do not invent facts, figures, or conclusions that are not present.
+3. Objectivity: write from an objective, third-person perspective.
+4. Output Format: plain text only — no title, no bullet points, no "摘要" prefix, and no commentary before or after the summary.
+
+---Document Content---
+{content}
+
+---Output---
+"""
+
 PROMPTS["rag_response"] = """---Role---
 
 You are an expert AI assistant specializing in synthesizing information from a provided knowledge base. Your primary function is to answer user queries accurately by ONLY using the information within the provided **Context**.

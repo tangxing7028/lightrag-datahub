@@ -22,6 +22,7 @@ import time
 import traceback
 import uuid
 from contextlib import AsyncExitStack
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -43,6 +44,7 @@ from lightrag.constants import (
     FULL_DOCS_FORMAT_LIGHTRAG,
     FULL_DOCS_FORMAT_PENDING_PARSE,
     FULL_DOCS_FORMAT_RAW,
+    DOC_SUMMARY_INPUT_CHAR_LIMIT,
     KG_PURGE_METADATA_KEY,
     KG_WRITE_STATE_GRAPH_MUTATION_STARTED,
     KG_WRITE_STATE_METADATA_KEY,
@@ -79,6 +81,7 @@ from lightrag import pipeline_metrics
 from lightrag.kg.pipeline_ingress import PipelineIngressMessage
 from lightrag.operate import merge_nodes_and_edges
 from lightrag.parser.base import ParseContext
+from lightrag.prompt import PROMPTS
 from lightrag.parser.llm_bridge import LLMBridgePipelineCancelled
 from lightrag.parser.registry import (
     get_parser,
@@ -96,6 +99,7 @@ from lightrag.utils import (
     _serialize_cache_variant,
     compute_args_hash,
     compute_mdhash_id,
+    doc_summary_vector_id,
     enforce_chunk_token_limit_before_embedding,
     generate_cache_key,
     generate_track_id,
@@ -115,6 +119,7 @@ from lightrag.utils import (
     merge_truncation_metadata,
     TokenLimitTruncationTally,
     tolerant_load_json_dict,
+    use_llm_func_with_cache,
     validate_file_path_security,
 )
 from lightrag.sidecar.artifact_store import (
@@ -673,6 +678,7 @@ class _PipelineMixin:
         parse_engine: str | list[str] | None = None,
         process_options: str | list[str] | None = None,
         chunk_options: dict | list[dict] | None = None,
+        summary_options: dict | list[dict] | None = None,
         admission_token: str | None = None,
         from_scan: bool = False,
     ) -> str:
@@ -733,6 +739,14 @@ class _PipelineMixin:
                 :func:`lightrag.utils_pipeline.apply_trusted_sentence_split_regex`
                 and GHSA-32jh-39m7-8x84.  See
                 ``docs/FileProcessingPipeline.md`` for the schema.
+            summary_options: per-document summary contract (DataHub fork).
+                Accepted as ``dict`` (broadcast to every input) or
+                ``list[dict]`` (aligned with ``input``). Shape:
+                ``{"enable_summary": bool, "model_config": dict | None}``.
+                Persisted to ``full_docs[doc_id]['summary_options']`` and read
+                by the process-stage summary hook; ``enable_summary=True`` is
+                additionally mirrored to ``doc_status.metadata`` so admin UIs
+                can surface it without a full_docs lookup.
             admission_token: the pending-enqueue reservation the caller already
                 holds (endpoints reserve one before reading the request body).
                 With ``MAX_PENDING_DOCUMENTS > 0`` the admission guard
@@ -862,6 +876,8 @@ class _PipelineMixin:
             process_options = [process_options] * len(input)
         if isinstance(chunk_options, dict):
             chunk_options = [chunk_options] * len(input)
+        if isinstance(summary_options, dict):
+            summary_options = [summary_options] * len(input)
         # If file_paths is provided, ensure it matches the number of documents
         if file_paths is not None:
             if isinstance(file_paths, str):
@@ -896,6 +912,10 @@ class _PipelineMixin:
         if chunk_options is not None and len(chunk_options) != len(input):
             raise ValueError(
                 "Number of chunk_options dicts must match the number of documents"
+            )
+        if summary_options is not None and len(summary_options) != len(input):
+            raise ValueError(
+                "Number of summary_options dicts must match the number of documents"
             )
 
         def _parse_engine_at(index: int, doc_format: str) -> str | None:
@@ -969,6 +989,19 @@ class _PipelineMixin:
             if chunk_options is not None:
                 return slim_chunk_options(chunk_options[index], doc_options)
             return resolve_chunk_options(self.addon_params, process_options=doc_options)
+
+        def _summary_options_at(index: int) -> dict[str, Any] | None:
+            """Per-doc summary contract; None when the doc opts out."""
+            if summary_options is None:
+                return None
+            opts = summary_options[index]
+            if not isinstance(opts, dict) or not opts.get("enable_summary"):
+                return None
+            model_config = opts.get("model_config")
+            return {
+                "enable_summary": True,
+                "model_config": model_config if isinstance(model_config, dict) else None,
+            }
 
         # 1. Validate ids and build contents (when lightrag: no content dedup, content may be empty)
         if ids is not None:
@@ -1068,6 +1101,10 @@ class _PipelineMixin:
             # so the per-doc parameters are frozen even when ``F``
             # (default) is used.
             content_data["chunk_options"] = _chunk_options_at(index)
+            # Per-document summary contract: only present when the caller
+            # opted this document into summary generation.
+            if summary_opts := _summary_options_at(index):
+                content_data["summary_options"] = summary_opts
             contents[doc_id] = content_data
 
         # ``docs_format`` decides the ingestion path; ``ids`` only overrides
@@ -1139,6 +1176,10 @@ class _PipelineMixin:
                 # Mirror process_options into doc_status.metadata so admin UIs
                 # can surface the per-document strategy without a full_docs lookup.
                 metadata["process_options"] = options_str
+            if (content_data.get("summary_options") or {}).get("enable_summary"):
+                # Same mirroring rationale as process_options; the process-stage
+                # summary hook reads the authoritative flag from full_docs.
+                metadata["enable_summary"] = True
             source_file = _read_source_file(content_data)
             if source_file:
                 metadata["source_file"] = source_file
@@ -1471,6 +1512,31 @@ class _PipelineMixin:
                     full_docs_data[doc_id]["chunk_options"] = contents[doc_id][
                         "chunk_options"
                     ]
+                summary_options = contents[doc_id].get("summary_options")
+                if summary_options is not None:
+                    # Keep credentials and other auth-bearing provider options
+                    # in process memory only. The full_docs row is durable
+                    # state and must contain an observability-safe snapshot.
+                    raw_model_config = (
+                        summary_options.get("model_config")
+                        if isinstance(summary_options, dict)
+                        else None
+                    )
+                    if isinstance(raw_model_config, dict):
+                        summary_configs = getattr(
+                            self, "_summary_model_configs", None
+                        )
+                        if isinstance(summary_configs, dict):
+                            summary_configs[str(doc_id)] = deepcopy(raw_model_config)
+                        persisted_model_config = self._scrubbed_llm_metadata(
+                            raw_model_config
+                        )
+                    else:
+                        persisted_model_config = None
+                    full_docs_data[doc_id]["summary_options"] = {
+                        "enable_summary": True,
+                        "model_config": persisted_model_config,
+                    }
             await self.full_docs.upsert(full_docs_data)
             # Persist data to disk immediately
             await self.full_docs.index_done_callback()
@@ -4893,6 +4959,18 @@ class _PipelineMixin:
                     (content_data or {}).get("parse_format"),
                 )
 
+                # Document summary (DataHub fork, opt-in via the upload-time
+                # enable_summary contract): summarize the parsed markdown body
+                # and store one vector in the doc_summaries namespace. Runs
+                # after artifact staging (which finalizes the body) and before
+                # chunking; advisory — failures are warnings, never fatal.
+                await self._generate_doc_summary_before_chunking(
+                    doc_id=doc_id,
+                    content_data=content_data,
+                    content=content,
+                    file_path=file_path,
+                )
+
                 # Decode per-document processing options once; later stages
                 # (multimodal hook / KG extraction) re-read them from
                 # full_docs as well.
@@ -6202,6 +6280,170 @@ class _PipelineMixin:
             f"rewrote {rewrite_count} <drawing> path(s) to permanent URLs"
         )
         return updated
+
+    # ============================================================
+    # Document summary generation (DataHub fork, opt-in per upload)
+    # ============================================================
+
+    def _resolve_summary_llm_func(
+        self, model_config: dict[str, Any] | None
+    ) -> tuple[Any, Any]:
+        """Pick the LLM func for one document's summary call.
+
+        With a per-upload ``summary_model_config`` override, build a one-off
+        raw func through the registered role-LLM builder (the same mechanism
+        ``update_llm_role_config`` uses; the override dict follows the role
+        metadata convention: binding/model/host/api_key/timeout/max_async/
+        provider_options). Without an override — or when the override cannot
+        be realized (no builder registered, invalid values) — fall back to
+        the workspace default ``llm_model_func``.
+
+        Returns ``(llm_func, llm_cache_identity)``; the identity partitions
+        the LLM response cache across model overrides.
+        """
+        if isinstance(model_config, dict) and model_config:
+            builder = getattr(self, "_llm_role_builder", None)
+            if builder is not None:
+                try:
+                    func, built_kwargs = builder("query", dict(model_config))
+                    if built_kwargs:
+                        func = partial(func, **built_kwargs)
+                    cache_identity = {
+                        key: model_config.get(key)
+                        for key in ("binding", "model", "host")
+                        if model_config.get(key) is not None
+                    }
+                    return func, cache_identity or None
+                except Exception as exc:
+                    logger.warning(
+                        f"[summary] invalid summary_model_config ({exc}); "
+                        "falling back to the workspace default llm_model_func"
+                    )
+            else:
+                logger.warning(
+                    "[summary] summary_model_config was provided but no role "
+                    "LLM builder is registered; falling back to the workspace "
+                    "default llm_model_func"
+                )
+        global_config = self._build_global_config()
+        return self.llm_model_func, get_llm_cache_identity(global_config, "query")
+
+    async def _summarize_doc_content(
+        self,
+        *,
+        doc_id: str,
+        content: str,
+        model_config: dict[str, Any] | None,
+    ) -> str:
+        """LLM-summarize the (already truncated) parsed body of one document."""
+        llm_func, cache_identity = self._resolve_summary_llm_func(model_config)
+        prompt = PROMPTS["doc_summary"].format(content=content)
+        summary, _ = await use_llm_func_with_cache(
+            prompt,
+            llm_func,
+            llm_response_cache=getattr(self, "llm_response_cache", None),
+            cache_type="docsummary",
+            llm_cache_identity=cache_identity,
+        )
+        return summary.strip() if isinstance(summary, str) else ""
+
+    async def _generate_doc_summary_before_chunking(
+        self,
+        *,
+        doc_id: str,
+        content_data: dict[str, Any] | None,
+        content: str | None,
+        file_path: str | None,
+    ) -> None:
+        """Generate and store the per-document summary vector (opt-in).
+
+        Mounted in ``process_single_document`` after artifact staging, before
+        chunking: it reads the parsed markdown body from ``full_docs`` (via
+        the caller's already-stripped ``content``), summarizes its first
+        ``DOC_SUMMARY_INPUT_CHAR_LIMIT`` characters, embeds the summary with
+        the same embedding func as chunks, and upserts one row into the
+        ``{workspace}_doc_summaries`` vector namespace.
+
+        Failure policy: summary generation/storage is advisory — any error is
+        logged as a warning and the document continues through the normal
+        parse pipeline without a summary (it simply never matches the
+        summary-search first stage).
+        """
+        summary_opts = (content_data or {}).get("summary_options")
+        if not isinstance(summary_opts, dict) or not summary_opts.get(
+            "enable_summary"
+        ):
+            return
+        if not isinstance(content, str) or not content.strip():
+            logger.warning(
+                f"[summary] {doc_id}: enable_summary is set but the parsed "
+                "body is empty; skipping summary generation"
+            )
+            return
+        vdb = getattr(self, "doc_summaries_vdb", None)
+        if vdb is None:
+            logger.warning(
+                f"[summary] {doc_id}: enable_summary is set but the "
+                "doc-summaries vector store is unavailable; skipping summary "
+                "generation"
+            )
+            return
+
+        # A persisted summary_options snapshot is deliberately scrubbed and
+        # therefore cannot be used to reconstruct an upload-time override
+        # after restart. In that case the registered workspace default is the
+        # only valid fallback. Same-process uploads use the private map above.
+        summary_configs = getattr(self, "_summary_model_configs", {})
+        runtime_model_config = (
+            summary_configs.get(str(doc_id))
+            if isinstance(summary_configs, dict)
+            else None
+        )
+        try:
+            summary_text = await self._summarize_doc_content(
+                doc_id=doc_id,
+                content=content[:DOC_SUMMARY_INPUT_CHAR_LIMIT],
+                model_config=(
+                    runtime_model_config
+                    if isinstance(runtime_model_config, dict)
+                    else None
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[summary] {doc_id}: summary generation failed; continuing "
+                f"without a summary: {exc}"
+            )
+            return
+        if not summary_text:
+            logger.warning(
+                f"[summary] {doc_id}: LLM returned an empty summary; "
+                "continuing without a summary"
+            )
+            return
+
+        try:
+            await vdb.upsert(
+                {
+                    doc_summary_vector_id(doc_id): {
+                        "content": summary_text,
+                        "full_doc_id": doc_id,
+                        "file_path": file_path or "unknown_source",
+                    }
+                }
+            )
+            # Flush immediately: summary rows are one-per-document and the
+            # batch-level _insert_done flush only covers the chunk stores.
+            await vdb.index_done_callback()
+            logger.info(
+                f"[summary] {doc_id}: stored doc summary "
+                f"({len(summary_text)} chars) in the doc_summaries namespace"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[summary] {doc_id}: failed to store the summary vector; "
+                f"continuing without a summary: {exc}"
+            )
 
     async def _export_processed_doc_artifacts(
         self,

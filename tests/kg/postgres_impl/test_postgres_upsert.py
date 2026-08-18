@@ -270,6 +270,10 @@ async def test_upsert_full_docs_tuple_order():
             "process_options": "Fi",
             "chunk_options": {"chunk_token_size": 1200, "chunk_overlap": 100},
             "parse_engine": "mineru",
+            "summary_options": {
+                "enable_summary": True,
+                "model_config": {"binding": "openai", "api_key": "secret"},
+            },
         }
     }
     await storage.upsert(data)
@@ -278,7 +282,8 @@ async def test_upsert_full_docs_tuple_order():
     _, rows = storage._captured[0]
     row = rows[0]
     # SQL: (id, content, doc_name, workspace, sidecar_location, parse_format,
-    #       content_hash, process_options, chunk_options, parse_engine)
+    #       content_hash, process_options, chunk_options, parse_engine,
+    #       summary_options)
     assert row[0] == "doc-1"
     assert row[1] == "full text"
     assert row[2] == "/path/doc.[mineru-Fi].pdf"
@@ -289,6 +294,10 @@ async def test_upsert_full_docs_tuple_order():
     assert row[7] == "Fi"
     assert json.loads(row[8]) == {"chunk_token_size": 1200, "chunk_overlap": 100}
     assert row[9] == "mineru"
+    assert json.loads(row[10]) == {
+        "enable_summary": True,
+        "model_config": {"binding": "openai", "api_key": "secret"},
+    }
 
 
 @pytest.mark.asyncio
@@ -315,6 +324,7 @@ async def test_upsert_full_docs_missing_pipeline_fields_pass_through_as_none():
     assert row[7] is None  # process_options
     assert json.loads(row[8]) == {}  # chunk_options default
     assert row[9] is None  # parse_engine
+    assert json.loads(row[10]) == {}  # summary_options default
 
 
 @pytest.mark.asyncio
@@ -331,6 +341,7 @@ async def test_upsert_full_docs_none_chunk_options_defaults_to_empty_dict():
 
     _, rows = storage._captured[0]
     assert json.loads(rows[0][8]) == {}
+    assert json.loads(rows[0][10]) == {}
 
 
 @pytest.mark.asyncio
@@ -369,6 +380,9 @@ async def test_upsert_full_docs_sql_protects_partial_writes():
     assert "excluded.chunk_options is null" in normalized
     assert "excluded.chunk_options = '{}'::jsonb" in normalized
     assert "lightrag_doc_full.chunk_options" in normalized
+    assert "excluded.summary_options is null" in normalized
+    assert "excluded.summary_options = '{}'::jsonb" in normalized
+    assert "lightrag_doc_full.summary_options" in normalized
 
     # content / doc_name remain straight overwrites — they ARE the payload
     assert "content = excluded.content" in normalized
