@@ -172,6 +172,7 @@ from lightrag.utils import (
     EmbeddingFunc,
     always_get_an_event_loop,
     compute_mdhash_id,
+    doc_summary_vector_id,
     priority_limit_async_func_call,
     sanitize_text_for_encoding,
     check_storage_env_vars,
@@ -1466,6 +1467,20 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             meta_fields={"full_doc_id", "content", "file_path"},
         )
 
+        # Per-document summary vectors (DataHub fork): one row per document in
+        # the ``{workspace}_doc_summaries`` namespace, backing the
+        # ``enable_summary_search`` two-stage retrieval. Milvus and PostgreSQL
+        # provide the schema and document allow-list semantics; other backends
+        # leave this None and the feature degrades to normal retrieval.
+        self.doc_summaries_vdb: BaseVectorStorage | None = None
+        if self.vector_storage in {"MilvusVectorDBStorage", "PGVectorStorage"}:
+            self.doc_summaries_vdb = self.vector_db_storage_cls(  # type: ignore
+                namespace=NameSpace.VECTOR_STORE_DOC_SUMMARIES,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+                meta_fields={"full_doc_id", "content", "file_path"},
+            )
+
         # Initialize document status storage
         self.doc_status: DocStatusStorage = self.doc_status_storage_cls(
             namespace=NameSpace.DOC_STATUS,
@@ -1484,6 +1499,11 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
         self._llm_role_builder = None
         self._retired_llm_queue_cleanup_tasks: set[asyncio.Task] = set()
+
+        # Upload-time summary model overrides may contain provider credentials.
+        # Keep the complete contract only in process memory; the persisted
+        # full_docs row receives a scrubbed copy in the pipeline mixin.
+        self._summary_model_configs: dict[str, dict[str, Any]] = {}
 
         # The event loop this instance's storages bind to (set in
         # initialize_storages). Kept off the dataclass fields so asdict() in
@@ -1590,6 +1610,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 self.entities_vdb,
                 self.relationships_vdb,
                 self.chunks_vdb,
+                self.doc_summaries_vdb,
                 self.chunk_entity_relation_graph,
                 self.llm_response_cache,
                 self.doc_status,
@@ -1658,6 +1679,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 ("entities_vdb", self.entities_vdb),
                 ("relationships_vdb", self.relationships_vdb),
                 ("chunks_vdb", self.chunks_vdb),
+                ("doc_summaries_vdb", self.doc_summaries_vdb),
                 ("chunk_entity_relation_graph", self.chunk_entity_relation_graph),
                 ("llm_response_cache", self.llm_response_cache),
                 ("doc_status", self.doc_status),
@@ -2964,6 +2986,15 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             # deferred-commit on the JSON backend, and reporting a rollback
             # as successful while the FAILED journal row can reappear after
             # a crash would be a false success.
+            try:
+                await self._delete_doc_summary(doc_id)
+            except Exception as summary_delete_error:
+                logger.warning(
+                    "Failed to delete doc summary while rolling back document "
+                    "%s: %s",
+                    doc_id,
+                    summary_delete_error,
+                )
             await self.full_docs.delete([doc_id])
             await self.doc_status.delete([doc_id])
             await self._flush_storages([self.full_docs, self.doc_status])
@@ -4065,6 +4096,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             # otherwise /query/data silently drops doc_ids and filters nothing.
             doc_ids=param.doc_ids,
             cosine_threshold=param.cosine_threshold,
+            enable_summary_search=param.enable_summary_search,
         )
 
         query_result = None
@@ -4082,6 +4114,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 hashing_kv=self.llm_response_cache,
                 system_prompt=None,
                 chunks_vdb=self.chunks_vdb,
+                doc_summaries_vdb=getattr(self, "doc_summaries_vdb", None),
             )
         elif data_param.mode == "naive":
             logger.debug(f"[aquery_data] Using naive_query for mode: {data_param.mode}")
@@ -4093,6 +4126,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 hashing_kv=self.llm_response_cache,
                 system_prompt=None,
                 text_chunks_db=self.text_chunks,
+                doc_summaries_vdb=getattr(self, "doc_summaries_vdb", None),
             )
         elif data_param.mode == "bypass":
             logger.debug("[aquery_data] Using bypass mode")
@@ -4181,6 +4215,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     hashing_kv=self.llm_response_cache,
                     system_prompt=system_prompt,
                     chunks_vdb=self.chunks_vdb,
+                    doc_summaries_vdb=getattr(self, "doc_summaries_vdb", None),
                     progress_callback=progress_callback,
                 )
             elif param.mode == "naive":
@@ -4192,6 +4227,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     hashing_kv=self.llm_response_cache,
                     system_prompt=system_prompt,
                     text_chunks_db=self.text_chunks,
+                    doc_summaries_vdb=getattr(self, "doc_summaries_vdb", None),
                     progress_callback=progress_callback,
                 )
             elif param.mode == "bypass":
@@ -5621,6 +5657,25 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
         return rebuild_report
 
+    async def _delete_doc_summary(self, doc_id: str) -> None:
+        """Delete the per-document summary vector for ``doc_id``, if any.
+
+        The row id is deterministic (``doc_summary_vector_id``), so no lookup
+        is needed and deleting a non-existent id is a backend no-op. A None
+        store (non-Milvus backend) means the workspace cannot hold summaries.
+        """
+        # Upload-time model overrides are process-local. Clear the mapping on
+        # every deletion path, even when this backend has no summary store or
+        # the vector delete fails.
+        summary_configs = getattr(self, "_summary_model_configs", None)
+        if isinstance(summary_configs, dict):
+            summary_configs.pop(str(doc_id), None)
+        vdb = getattr(self, "doc_summaries_vdb", None)
+        if vdb is None:
+            return
+        await vdb.delete([doc_summary_vector_id(doc_id)])
+        await vdb.index_done_callback()
+
     async def adelete_by_doc_id(
         self, doc_id: str, delete_llm_cache: bool = False
     ) -> DeletionResult:
@@ -5923,6 +5978,14 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                         ) from cache_err
 
                 try:
+                    try:
+                        await self._delete_doc_summary(doc_id)
+                    except Exception as summary_delete_error:
+                        logger.warning(
+                            "Failed to delete doc summary for empty document %s: %s",
+                            doc_id,
+                            summary_delete_error,
+                        )
                     # Still need to delete the doc status and full doc.
                     # Delete doc_status first: if full_docs.delete fails on retry, the
                     # doc_status record is already gone so the retry finds no record and
@@ -6123,6 +6186,18 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             # doc_status is deleted first so that if full_docs.delete fails, a retry
             # finds no doc_status record and treats the document as already gone,
             # rather than finding a doc_status that points to a missing full_docs entry.
+            #
+            # The doc_summaries vector goes first and stays best-effort: a
+            # workspace that never generated a summary for this document has
+            # nothing to delete, and a summary-cleanup failure must not block
+            # the document deletion itself.
+            try:
+                await self._delete_doc_summary(doc_id)
+            except Exception as summary_delete_error:
+                logger.warning(
+                    f"Failed to delete doc summary for document {doc_id}: "
+                    f"{summary_delete_error}"
+                )
             try:
                 deletion_stage = "delete_doc_entries"
                 in_final_delete_stage = True

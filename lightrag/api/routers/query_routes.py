@@ -125,7 +125,15 @@ class QueryRequest(BaseModel):
         description="Optional allow-list of document IDs restricting retrieval scope. "
         "Omit (null) for no filtering. An empty list means zero authorized documents "
         "and returns no retrieval results (fail-closed). "
-        "Currently only enforced by the PostgreSQL vector storage backend.",
+        "Enforced by the PostgreSQL and Milvus vector storage backends.",
+    )
+
+    enable_summary_search: Optional[bool] = Field(
+        default=None,
+        description="Enable two-stage summary-first retrieval: search per-document "
+        "LLM summaries first, then restrict the chunk search to the matched "
+        "documents. Falls back to regular retrieval when no summary matches. "
+        "Defaults to False.",
     )
 
     cosine_threshold: Optional[float] = Field(

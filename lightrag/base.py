@@ -182,6 +182,17 @@ class QueryParam:
     value to be returned by vector retrieval.
     """
 
+    enable_summary_search: bool = False
+    """Enable two-stage summary-first retrieval (DataHub fork).
+
+    When True, retrieval first searches the workspace's ``doc_summaries``
+    vector namespace (one LLM-generated summary per opted-in document),
+    collects the matched ``full_doc_id`` values, and then restricts the
+    chunk search to those documents via the ``doc_ids`` allow-list. No
+    summary hit (or a not-yet-created summaries namespace) falls back to
+    the regular full-corpus chunk retrieval.
+    """
+
 
 @dataclass
 class StorageNameSpace(ABC):
