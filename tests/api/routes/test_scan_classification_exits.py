@@ -299,7 +299,7 @@ def _scan_rig(tmp_path, monkeypatch, rag):
     monkeypatch.setattr(
         _document_routes, "global_args", SimpleNamespace(scan_enqueue_batch_size=8)
     )
-    doc_manager = DocumentManager(str(tmp_path))
+    doc_manager = DocumentManager(str(tmp_path), workspace=rag.workspace)
     batched: list[Path] = []
 
     async def _capture_batch(_rag, candidates, _track_id):

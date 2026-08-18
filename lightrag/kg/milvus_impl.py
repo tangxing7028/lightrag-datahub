@@ -2345,7 +2345,12 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 self._pending_vector_docs[doc_id] = pdoc
 
     async def query(
-        self, query: str, top_k: int, query_embedding: list[float] = None
+        self,
+        query: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+        doc_ids: list[str] | None = None,
+        cosine_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
         """Similarity search against the persisted Milvus collection.
 
@@ -2354,6 +2359,12 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         embeds and writes them. Callers that need read-after-write visibility
         for similarity search must run an explicit flush first.
         """
+        if doc_ids is not None:
+            logger.warning(
+                "MilvusVectorDBStorage does not implement doc_ids filtering; "
+                "the parameter is accepted for interface compatibility and "
+                "ignored. Only PGVectorStorage enforces document allow-lists."
+            )
         # Ensure collection is loaded before querying
         self._ensure_collection_loaded()
 

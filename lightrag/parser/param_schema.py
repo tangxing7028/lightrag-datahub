@@ -369,6 +369,16 @@ _ENGINE_PARAM_SPECS: dict[str, tuple[EngineParamSpec, ...]] = {
             kind="enum",
             enum_values=frozenset({"auto", "txt", "ocr"}),
         ),
+        # ``parse_method`` is the provider-neutral spelling used by
+        # DataHub's upload contract.  It applies to official, local and
+        # wrapper MinerU modes; the legacy local_parse_method alias remains
+        # accepted for existing filename hints.
+        EngineParamSpec(
+            canonical="parse_method",
+            aliases=frozenset({"method"}),
+            kind="enum",
+            enum_values=frozenset({"auto", "txt", "ocr"}),
+        ),
     ),
     PARSER_ENGINE_DOCLING: (
         EngineParamSpec(canonical="force_ocr", aliases=frozenset({"ocr"}), kind="bool"),

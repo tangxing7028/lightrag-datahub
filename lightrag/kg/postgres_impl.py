@@ -3538,6 +3538,31 @@ class PGVectorStorage(BaseVectorStorage):
             )
 
     @staticmethod
+    async def _pg_create_chunk_ids_gin_index(db: PostgreSQLDB, table_name: str) -> None:
+        """Create a GIN index on the ``chunk_ids`` array column.
+
+        Supports the document allow-list filter (``chunk_ids && ...``) used by
+        entity/relationship vector search. Only applies to the entity and
+        relationship vector tables, which are the ones carrying a ``chunk_ids``
+        column. Idempotent via IF NOT EXISTS.
+
+        Args:
+            db: PostgreSQLDB instance
+            table_name: Name of the vector table to index
+        """
+        index_name = _safe_index_name(table_name, "chunk_ids_gin")
+        try:
+            create_gin_index_sql = f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} USING gin (chunk_ids)"
+            logger.info(
+                f"PostgreSQL, Creating GIN index {index_name} on table {table_name}"
+            )
+            await db.execute(create_gin_index_sql)
+        except Exception as e:
+            logger.error(
+                f"PostgreSQL, Failed to create GIN index {index_name}, Got: {e}"
+            )
+
+    @staticmethod
     async def _pg_migrate_workspace_data(
         db: PostgreSQLDB,
         legacy_table_name: str,
@@ -3938,6 +3963,15 @@ class PGVectorStorage(BaseVectorStorage):
                 legacy_table_name=self.legacy_table_name,
                 base_table=self.legacy_table_name,  # base_table for DDL template lookup
             )
+
+            # GIN index on chunk_ids for the document allow-list filter
+            # (entity/relationship tables only; idempotent).
+            if is_namespace(
+                self.namespace, NameSpace.VECTOR_STORE_ENTITIES
+            ) or is_namespace(self.namespace, NameSpace.VECTOR_STORE_RELATIONSHIPS):
+                await PGVectorStorage._pg_create_chunk_ids_gin_index(
+                    self.db, self.table_name
+                )
 
         if self._flush_lock is None:
             self._flush_lock = get_namespace_lock(
@@ -4416,8 +4450,18 @@ class PGVectorStorage(BaseVectorStorage):
 
     #################### query method ###############
     async def query(
-        self, query: str, top_k: int, query_embedding: list[float] = None
+        self,
+        query: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+        doc_ids: list[str] | None = None,
+        cosine_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
+        # Fail closed without touching the database: an explicit empty
+        # allow-list authorizes zero documents, so zero results are returned.
+        if doc_ids is not None and len(doc_ids) == 0:
+            return []
+
         if query_embedding is not None:
             embedding = query_embedding
         else:
@@ -4434,17 +4478,74 @@ class PGVectorStorage(BaseVectorStorage):
             if getattr(self.db, "vector_index_type", None) == "HNSW_HALFVEC"
             else "vector"
         )
-        sql = SQL_TEMPLATES[self.namespace].format(
-            table_name=self.table_name, vector_cast=vector_cast
+
+        # Per-query threshold override; None keeps the storage-level default.
+        effective_threshold = (
+            cosine_threshold
+            if cosine_threshold is not None
+            else self.cosine_better_than_threshold
         )
+
+        # Optional document allow-list filter, appended as an extra WHERE clause.
+        # The filter always binds as positional parameter $5 (after the fixed
+        # $1..$4 used by the base templates).
+        doc_filter = ""
         params = {
             "workspace": self.workspace,
-            "closer_than_threshold": 1 - self.cosine_better_than_threshold,
+            "closer_than_threshold": 1 - effective_threshold,
             "top_k": top_k,
             "embedding": embedding,
         }
+        if doc_ids is not None:
+            params["doc_ids"] = list(doc_ids)
+            if is_namespace(self.namespace, NameSpace.VECTOR_STORE_CHUNKS):
+                doc_filter = "AND full_doc_id = ANY($5)"
+            else:
+                # entities/relationships tables carry no full_doc_id column;
+                # restrict via their chunk_ids array overlapping the chunks
+                # that belong to authorized documents. The chunks table is
+                # derived from the same embedding model suffix as this table.
+                chunks_base_table = namespace_to_table_name(
+                    NameSpace.VECTOR_STORE_CHUNKS
+                )
+                chunks_table_name = (
+                    f"{chunks_base_table}_{self.model_suffix}"
+                    if self.model_suffix
+                    else chunks_base_table
+                )
+                doc_filter = (
+                    f"AND chunk_ids && (SELECT array_agg(id) FROM {chunks_table_name}"
+                    " WHERE workspace = $1 AND full_doc_id = ANY($5))"
+                )
+
+        sql = SQL_TEMPLATES[self.namespace].format(
+            table_name=self.table_name,
+            vector_cast=vector_cast,
+            doc_filter=doc_filter,
+        )
         results = await self.db.query(sql, params=list(params.values()), multirows=True)
         return results
+
+    async def get_doc_ids_by_chunk_ids(self, chunk_ids: list[str]) -> dict[str, str]:
+        """Resolve chunk IDs to their owning document IDs (``full_doc_id``).
+
+        Only meaningful on the chunks namespace table, which carries the
+        ``full_doc_id`` column. Returns an empty mapping for other namespaces.
+        """
+        if not chunk_ids:
+            return {}
+        if not is_namespace(self.namespace, NameSpace.VECTOR_STORE_CHUNKS):
+            return {}
+        sql = (
+            f"SELECT id, full_doc_id FROM {self.table_name}"
+            " WHERE workspace = $1 AND id = ANY($2)"
+        )
+        rows = await self.db.query(
+            sql, params=[self.workspace, list(chunk_ids)], multirows=True
+        )
+        if not rows:
+            return {}
+        return {row["id"]: row["full_doc_id"] for row in rows}
 
     async def index_done_callback(self) -> None:
         await self._flush_pending_vector_ops()
@@ -9434,6 +9535,7 @@ SQL_TEMPLATES = {
                      FROM {table_name}
                      WHERE workspace = $1
                        AND content_vector <=> $4::{vector_cast} < $2
+                       {doc_filter}
                      ORDER BY content_vector <=> $4::{vector_cast}
                      LIMIT $3;
                      """,
@@ -9443,6 +9545,7 @@ SQL_TEMPLATES = {
                 FROM {table_name}
                 WHERE workspace = $1
                   AND content_vector <=> $4::{vector_cast} < $2
+                  {doc_filter}
                 ORDER BY content_vector <=> $4::{vector_cast}
                 LIMIT $3;
                 """,
@@ -9454,6 +9557,7 @@ SQL_TEMPLATES = {
               FROM {table_name}
               WHERE workspace = $1
                 AND content_vector <=> $4::{vector_cast} < $2
+                {doc_filter}
               ORDER BY content_vector <=> $4::{vector_cast}
               LIMIT $3;
               """,

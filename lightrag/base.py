@@ -163,6 +163,25 @@ class QueryParam:
     containing citation information for the retrieved content.
     """
 
+    doc_ids: list[str] | None = None
+    """Optional allow-list of document IDs restricting retrieval scope.
+
+    None (default) means no document-level filtering. An empty list means
+    "zero authorized documents" and must fail closed: retrieval returns no
+    results at all. An empty list is therefore NOT equivalent to None.
+
+    This is a mechanical filter only; it carries no permission semantics.
+    Callers are responsible for computing the authorized document set.
+    """
+
+    cosine_threshold: float | None = None
+    """Optional per-query override for the vector store cosine similarity threshold.
+
+    None (default) keeps the storage-level ``cosine_better_than_threshold``.
+    When set, results must have cosine similarity strictly greater than this
+    value to be returned by vector retrieval.
+    """
+
 
 @dataclass
 class StorageNameSpace(ABC):
@@ -273,7 +292,12 @@ class BaseVectorStorage(StorageNameSpace, ABC):
 
     @abstractmethod
     async def query(
-        self, query: str, top_k: int, query_embedding: list[float] = None
+        self,
+        query: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+        doc_ids: list[str] | None = None,
+        cosine_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
         """Query the vector storage and retrieve top_k results.
 
@@ -282,7 +306,37 @@ class BaseVectorStorage(StorageNameSpace, ABC):
             top_k: Number of top results to return
             query_embedding: Optional pre-computed embedding for the query.
                            If provided, skips embedding computation for better performance.
+            doc_ids: Optional allow-list of document IDs restricting results to
+                           chunks/entities/relationships sourced from these documents.
+                           None means no filtering; an empty list means zero authorized
+                           documents and must return zero results (fail-closed).
+                           Currently only implemented by the PostgreSQL (pgvector)
+                           backend; other backends accept the parameter for signature
+                           compatibility and may ignore it (with a warning).
+            cosine_threshold: Optional per-query cosine similarity threshold override.
+                           None keeps the storage-level ``cosine_better_than_threshold``.
+                           Currently only implemented by the PostgreSQL (pgvector)
+                           backend.
         """
+
+    async def get_doc_ids_by_chunk_ids(self, chunk_ids: list[str]) -> dict[str, str]:
+        """Map chunk IDs to their owning document IDs (``full_doc_id``).
+
+        Used to apply document allow-list filtering to graph-expansion edges
+        whose source chunk IDs live outside the vector store. The default
+        implementation returns an empty mapping; backends that can resolve
+        chunk -> document ownership (currently only the PostgreSQL backend)
+        should override it.
+
+        Args:
+            chunk_ids: Chunk IDs to look up.
+
+        Returns:
+            dict[str, str]: Mapping of chunk_id -> full_doc_id for the chunk
+            IDs that were found. Missing entries mean the document could not
+            be resolved.
+        """
+        return {}
 
     @abstractmethod
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:

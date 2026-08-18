@@ -68,6 +68,7 @@ def _hermetic_mineru_env(monkeypatch):
     monkeypatch.delenv("MINERU_API_MODE", raising=False)
     monkeypatch.delenv("MINERU_API_TOKEN", raising=False)
     monkeypatch.delenv("MINERU_LOCAL_ENDPOINT", raising=False)
+    monkeypatch.delenv("MINERU_WRAPPER_ENDPOINT", raising=False)
     monkeypatch.delenv("MINERU_OFFICIAL_ENDPOINT", raising=False)
     monkeypatch.delenv("MINERU_LOCAL_BACKEND", raising=False)
     monkeypatch.delenv("MINERU_LOCAL_PARSE_METHOD", raising=False)

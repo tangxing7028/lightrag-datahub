@@ -103,7 +103,7 @@ def test_candidates_are_spooled_then_written_in_global_mtime_order(
         files = [by_age[4], by_age[1], by_age[3], by_age[0], by_age[2]]
         events: list[tuple[str, object]] = []
 
-        def _iter_new_files():
+        def _iter_new_files(_input_dir=None):
             for file_path in files:
                 events.append(("yield", file_path.name))
                 yield file_path
@@ -153,7 +153,7 @@ def test_first_scan_wide_claim_wins_and_the_alias_is_archived(tmp_path, monkeypa
         plain.write_text("plain", encoding="utf-8")
         hinted.write_text("hinted", encoding="utf-8")
         ordered = [plain, hinted]  # pin the discovery order this test reasons about
-        doc_manager.iter_new_files = lambda: iter(ordered)
+        doc_manager.iter_new_files = lambda *_args: iter(ordered)
 
         batched: list[Path] = []
 
@@ -195,7 +195,9 @@ def test_unreadable_mtime_sorts_after_readable_candidates(tmp_path, monkeypatch)
         readable.write_text("body", encoding="utf-8")
         missing_b = tmp_path / "z-gone.txt"
         missing_a = tmp_path / "a-gone.txt"
-        doc_manager.iter_new_files = lambda: iter([missing_b, readable, missing_a])
+        doc_manager.iter_new_files = lambda *_args: iter(
+            [missing_b, readable, missing_a]
+        )
 
         ordered: list[str] = []
 

@@ -323,3 +323,70 @@ def test_replacement_char_chunk_skipped_not_failed(tmp_path: Path) -> None:
 
     assert "sidecar" not in chunks[0]  # provenance degraded for the corrupt chunk
     assert _refs(chunks[1]) == ["b2"]  # clean chunk still resolves
+
+
+@pytest.mark.offline
+def test_image_chunk_without_matchable_span_skips_sidecar_not_fails(
+    tmp_path: Path,
+) -> None:
+    # Artifact URL rewriting changes image paths in the chunk source after
+    # blocks.jsonl is written; an image-bearing chunk that cannot be relocated
+    # must degrade (no sidecar) instead of failing the whole document.
+    blocks_path = _write_blocks(tmp_path, [("b1", "Plain text without images.")])
+    chunks = [_span_chunk(
+        "# Heading\n\n![](images/abc.jpg)  \nimage caption",
+        7, 0, 10_000,
+    )]
+
+    backfill_chunk_sidecars(chunks, blocks_path)
+
+    assert "sidecar" not in chunks[0]
+
+@pytest.mark.offline
+def test_rewritten_artifact_marker_chunk_skips_sidecar_not_fails(tmp_path: Path) -> None:
+    # Regression: DocumentHub artifact URL rewriting replaces parser image/table
+    # paths AFTER blocks.jsonl is written, so a chunk carrying a rewritten marker
+    # (ai-service proxy URL / MinerU .blocks.assets/ path) cannot be relocated
+    # against the verbatim blocks. It must degrade (no sidecar) instead of failing
+    # the whole document - the same principle as the markdown-image exemption.
+    blocks_path = _write_blocks(tmp_path, [("b1", "Plain text without images.")])
+    chunks = [
+        _chunk(
+            'format="jpg" path="/api/ai/rag/kb/document-artifact?kb_id=1&doc_id=2&artifact_path=im.jpg"',
+            7,
+        ),
+    ]
+
+    backfill_chunk_sidecars(chunks, blocks_path)
+
+    assert "sidecar" not in chunks[0]
+
+
+@pytest.mark.offline
+def test_rewritten_assets_relative_path_chunk_skips_sidecar_not_fails(
+    tmp_path: Path,
+) -> None:
+    # MinerU per-block asset relative paths (.blocks.assets/...) are also rewritten
+    # before retrieval; a chunk holding such a path must not fail the document.
+    blocks_path = _write_blocks(tmp_path, [("b1", "Plain text without images.")])
+    chunks = [
+        _chunk("报表系统采购合同（中国联通）.blocks.assets/1d05a61f2ae3cff.png", 13),
+    ]
+
+    backfill_chunk_sidecars(chunks, blocks_path)
+
+    assert "sidecar" not in chunks[0]
+
+
+@pytest.mark.offline
+def test_similar_but_not_rewritten_text_still_fails_document(tmp_path: Path) -> None:
+    # Guard against over-broadly degrading: text that merely READs like a URL but
+    # carries no actual rewritten-artifact marker must still fail closed. Without a
+    # marker the chunk can be ambiguous, so the document stays FAILED.
+    blocks_path = _write_blocks(tmp_path, [("b1", "Plain text without images.")])
+    chunks = [_chunk("the document-artifact endpoint is not called here", 3)]
+
+    with pytest.raises(ChunkBlockMatchError) as exc:
+        backfill_chunk_sidecars(chunks, blocks_path)
+
+    assert exc.value.chunk_order_index == 3

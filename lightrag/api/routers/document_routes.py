@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import errno
+import json
 import math
 import os
 import re
@@ -42,6 +43,7 @@ from fastapi import (
     APIRouter,
     Depends,
     File,
+    Form,
     HTTPException,
     Query,
     Request,
@@ -108,10 +110,13 @@ from lightrag.parser.routing import (
     canonicalize_parser_hinted_basename,
     chunk_strategy_key,
     encode_parse_engine,
+    normalize_parser_engine,
     parse_process_options,
+    parser_engine_supports_suffix,
     resolve_chunk_options,
     resolve_parser_directives,
 )
+from lightrag.parser.registry import supported_parser_engines
 from lightrag.utils import (
     generate_track_id,
     move_file_to_parsed_dir,
@@ -121,6 +126,7 @@ from lightrag.kg.shared_storage import append_pipeline_history
 from lightrag.utils_pipeline import count_active_documents, read_source_file_basename
 from lightrag.api.admission import adopt_admission_ticket
 from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.api.workspace_manager import make_rag_dependency
 from ..config import global_args
 
 
@@ -319,6 +325,110 @@ def sanitize_filename(filename: str, input_dir: Path) -> str:
     return filename
 
 
+def _form_bool(value: str | None, default: bool) -> bool:
+    """Parse the upload contract's string booleans without truthiness traps."""
+    # Direct callers of the generated FastAPI endpoint (including internal
+    # tests) may observe the ``Form(None)`` marker as the Python default
+    # instead of a parsed request value. Treat that marker exactly like an
+    # omitted optional field rather than converting its repr to text.
+    if value is None or not isinstance(value, (str, bool, int, float)):
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise HTTPException(status_code=400, detail=f"布尔参数格式无效: {value!r}")
+
+
+def _upload_filename_with_directives(
+    filename: str,
+    *,
+    parser: str | None,
+    parse_method: str | None,
+    enable_image: str | None,
+    enable_table: str | None,
+    enable_equation: str | None,
+    skip_entity_extract: str | None,
+) -> str:
+    """Encode DataHub's per-document parse contract into native file hints.
+
+    The fork already persists and executes parser/process directives from the
+    ``.[engine-options].ext`` filename syntax.  Translating the multipart
+    fields here keeps the official pipeline as the single execution path and
+    avoids a second, fork-specific parser implementation.
+    """
+    if not isinstance(parser, str) or not parser.strip():
+        return filename
+    engine = normalize_parser_engine(parser)
+    if engine not in supported_parser_engines():
+        raise HTTPException(status_code=400, detail=f"不支持的解析器: {parser}")
+    method = (parse_method or "auto").strip().lower()
+    if method not in {"auto", "ocr", "txt"}:
+        raise HTTPException(status_code=400, detail=f"不支持的解析模式: {method}")
+
+    options = "".join(
+        flag
+        for flag, raw, default in (
+            ("i", enable_image, True),
+            ("t", enable_table, True),
+            ("e", enable_equation, True),
+            ("!", skip_entity_extract, False),
+        )
+        if _form_bool(raw, default)
+    )
+    source = Path(filename).name
+    suffix = Path(source).suffix
+    if not suffix:
+        raise HTTPException(status_code=400, detail="上传文件缺少可识别的扩展名")
+
+    # A knowledge-base parser is a default contract, not a guarantee that the
+    # selected external engine accepts every file type the UI can upload. For
+    # example, MinerU handles PDF and images but not Markdown. Preserve the
+    # per-file processing flags while routing such local formats through the
+    # native parser first (legacy is the compatibility fallback).
+    if not parser_engine_supports_suffix(engine, suffix):
+        fallback_engine = next(
+            (
+                candidate
+                for candidate in ("native", "legacy")
+                if candidate in supported_parser_engines()
+                and parser_engine_supports_suffix(candidate, suffix)
+            ),
+            None,
+        )
+        if fallback_engine is None:
+            supported = ", ".join(sorted(supported_parser_engines()))
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"解析器 {engine} 不支持文件后缀 {suffix.lower()}，"
+                    f"当前可用解析器：{supported}"
+                ),
+            )
+        engine = fallback_engine
+
+    engine_token = engine
+    if engine == "mineru" and method != "auto":
+        engine_token += f"(parse_method={method})"
+    if options:
+        engine_token += f"-{options}"
+    return f"{source[: -len(suffix)]}.[{engine_token}]{suffix}"
+
+
+def _parse_upload_chunking(value: str | None) -> "TextChunkingConfig | None":
+    """Decode the JSON multipart chunking contract before enqueueing bytes."""
+    if value is None or not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        raw = json.loads(value)
+        if not isinstance(raw, dict):
+            raise ValueError("chunking 必须是 JSON 对象")
+        return TextChunkingConfig.model_validate(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"切块配置无效: {exc}") from exc
+
+
 _UPLOAD_DIR_FD_SUPPORTED = os.open in os.supports_dir_fd
 
 
@@ -369,6 +479,48 @@ def upload_file_opener(input_dir: Path):
             dir_fd = -1
 
     return opener
+
+
+# Caller-supplied doc ids (POST /documents/upload ``doc_id`` form field)
+# become storage primary keys (full_docs / doc_status) and ride every
+# downstream reference (chunks' full_doc_id, track_status responses), so
+# they are restricted to a conservative charset. Snowflake-style numeric
+# ids and ``doc-``-prefixed hashes both fit this rule.
+MAX_CUSTOM_DOC_ID_LENGTH = 128
+_CUSTOM_DOC_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def validate_custom_doc_id(doc_id: str | None) -> str | None:
+    """Validate an optional caller-supplied doc id for the upload endpoint.
+
+    Returns the stripped id, or None when the caller did not supply one.
+    Non-string values (e.g. the ``Form(...)`` marker seen when the endpoint
+    function is invoked directly, bypassing FastAPI's dependency injection)
+    are treated as "not supplied".
+
+    Raises:
+        HTTPException: 400 when the id is blank or contains characters
+            outside ``[A-Za-z0-9_-]`` / exceeds the length cap.
+    """
+    if not isinstance(doc_id, str):
+        return None
+    stripped = doc_id.strip()
+    if not stripped:
+        raise HTTPException(
+            status_code=400,
+            detail="doc_id must be a non-empty string when provided",
+        )
+    if len(stripped) > MAX_CUSTOM_DOC_ID_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"doc_id exceeds the maximum length of {MAX_CUSTOM_DOC_ID_LENGTH} characters",
+        )
+    if not _CUSTOM_DOC_ID_PATTERN.fullmatch(stripped):
+        raise HTTPException(
+            status_code=400,
+            detail="doc_id may only contain letters, digits, hyphens and underscores, and must start with a letter or digit",
+        )
+    return stripped
 
 
 class ScanResponse(BaseModel):
@@ -1555,7 +1707,7 @@ class DocumentManager:
             if engine_endpoint_configured(engine)
         }
 
-    def iter_new_files(self) -> Iterator[Path]:
+    def iter_new_files(self, input_dir: Path | None = None) -> Iterator[Path]:
         """Yield new, routable input files ONE AT A TIME (LR2 §8.2).
 
         A single streaming pass: one ``scandir()`` over the input directory, no
@@ -1566,6 +1718,11 @@ class DocumentManager:
         entry name before yielding the first one. An interrupted scan needs no
         in-memory resume state — the next scan re-discovers, and the persistent
         ``doc_status`` rows are the deduplication authority.
+
+        ``input_dir`` overrides the directory to scan; ``None`` (default) scans
+        ``self.input_dir``. The scan endpoint passes the request workspace's
+        directory (see ``workspace_input_dir``) so a ``LIGHTRAG-WORKSPACE``
+        header-selected scan reads that workspace's drop folder.
 
         Files are admitted on the *available* engine suffix surface (so a
         hint-carrying file like ``img.[mineru].png`` is discoverable even when
@@ -1581,9 +1738,10 @@ class DocumentManager:
         from lightrag.parser.registry import available_engine_suffixes
         from lightrag.parser.routing import FilenameParserHintError
 
+        scan_dir = input_dir if input_dir is not None else self.input_dir
         suffixes = {f".{s}" for s in available_engine_suffixes()}
-        logger.debug(f"Streaming scan of {self.input_dir} for {len(suffixes)} suffixes")
-        with os.scandir(self.input_dir) as entries:
+        logger.debug(f"Streaming scan of {scan_dir} for {len(suffixes)} suffixes")
+        with os.scandir(scan_dir) as entries:
             for entry in entries:
                 file_path = Path(entry.path)
                 # Suffix comparison is case-sensitive, matching the per-suffix glob
@@ -2276,6 +2434,32 @@ def delete_file_variants_by_file_path(
     return deleted_files, errors
 
 
+def workspace_input_dir(doc_manager: "DocumentManager", workspace: str | None) -> Path:
+    """Resolve the on-disk input directory for one workspace.
+
+    Mirrors the layout :class:`DocumentManager` establishes at startup:
+    ``<base_input_dir>/<workspace>`` when a workspace is set, the base
+    directory otherwise. For the server's default workspace this equals
+    ``doc_manager.input_dir``; for a ``LIGHTRAG-WORKSPACE`` header-selected
+    instance it is that workspace's own directory, so a destructive clear
+    only touches the instance the request targeted. Falls back to
+    ``doc_manager.input_dir`` when the workspace name cannot be validated
+    (defence-in-depth: header-derived names are already sanitized upstream).
+    """
+    name = (workspace or "").strip()
+    if not name:
+        return doc_manager.base_input_dir
+    try:
+        validate_workspace(name)
+    except Exception:
+        logger.warning(
+            f"workspace_input_dir: invalid workspace name {safe_log_value(name)!r}; "
+            "falling back to the default input directory"
+        )
+        return doc_manager.input_dir
+    return doc_manager.base_input_dir / name
+
+
 async def record_scan_warning(rag: LightRAG, message: str) -> None:
     logger.warning(message)
     try:
@@ -2328,6 +2512,8 @@ async def pipeline_enqueue_file(
     from_scan: bool = False,
     admission_token: str | None = None,
     known_file_size: int | None = None,
+    doc_id: str | None = None,
+    chunking: "TextChunkingConfig | None" = None,
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -2347,6 +2533,10 @@ async def pipeline_enqueue_file(
             candidate spool recorded at discovery time; it feeds error reports
             only, so a size that went stale between discovery and enqueue costs
             nothing.
+        doc_id: optional caller-assigned document id (upload path only). When
+            provided it is forwarded as the enqueue ``ids`` override so the
+            pending_parse pipeline uses it as the document's full_doc_id
+            instead of ``md5(canonical file_path)``.
     Returns:
         tuple: (success: bool, track_id: str)
     """
@@ -2412,18 +2602,16 @@ async def pipeline_enqueue_file(
         # parse worker chunks this document with them. Absent params keep the
         # legacy path (chunk_options built at enqueue time from addon_params).
         hint_chunk_options = None
-        active_strategy = parse_process_options(api_process_options).chunking
-        hint_chunk_params = directives.chunk_params.get(active_strategy)
-        if hint_chunk_params:
+        if chunking is not None:
             try:
-                strategy_key = chunk_strategy_key(api_process_options)
-                hint_chunk_options = resolve_chunk_options(
-                    rag.addon_params, process_options=api_process_options
+                chunk_process_options, hint_chunk_options = _resolve_text_chunking(chunking, rag)
+                directive_flags = parse_process_options(process_options)
+                media_options = "".join(
+                    flag for flag, enabled in (("i", directive_flags.images), ("t", directive_flags.tables),
+                                               ("e", directive_flags.equations), ("!", directive_flags.skip_kg))
+                    if enabled
                 )
-                hint_chunk_options[strategy_key].update(hint_chunk_params)
-                _validate_effective_chunk_overlap(
-                    hint_chunk_options, strategy_key, strategy_key
-                )
+                api_process_options = media_options + chunk_process_options
             except ValueError as e:
                 error_files = [
                     {
@@ -2440,6 +2628,32 @@ async def pipeline_enqueue_file(
                     f"{file_path.name}: {e}"
                 )
                 return False, track_id
+        else:
+            active_strategy = parse_process_options(api_process_options).chunking
+            hint_chunk_params = directives.chunk_params.get(active_strategy)
+            if hint_chunk_params:
+                try:
+                    strategy_key = chunk_strategy_key(api_process_options)
+                    hint_chunk_options = resolve_chunk_options(
+                        rag.addon_params, process_options=api_process_options
+                    )
+                    hint_chunk_options[strategy_key].update(hint_chunk_params)
+                    _validate_effective_chunk_overlap(
+                        hint_chunk_options, strategy_key, strategy_key
+                    )
+                except ValueError as e:
+                    error_files = [
+                        {
+                            "file_path": str(file_path.name),
+                            "error_description": FILE_EXTRACTION_SUMMARY_PREFIX
+                            + "Chunk parameter error",
+                            "original_error": str(e),
+                            "file_size": file_size,
+                        }
+                    ]
+                    await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                    logger.error(f"[File Extraction]Invalid chunk parameters in {file_path.name}: {e}")
+                    return False, track_id
         # All engines defer parsing to the worker stage: the file is already
         # saved on disk, so we enqueue PENDING_PARSE with the chosen engine.
         # Legacy now extracts at the worker (LegacyParser) instead of eagerly
@@ -2463,6 +2677,10 @@ async def pipeline_enqueue_file(
                 # Only sent when the caller actually holds a reservation; None
                 # is the enqueue's own default and adding it would be noise.
                 enqueue_kwargs["admission_token"] = admission_token
+            if doc_id is not None:
+                # Caller-assigned id (upload path): pending_parse honors it as
+                # the full_doc_id instead of md5(canonical file_path).
+                enqueue_kwargs["ids"] = [doc_id]
             if hint_chunk_options is not None:
                 enqueue_kwargs["chunk_options"] = hint_chunk_options
             enqueue_result = await rag.apipeline_enqueue_documents("", **enqueue_kwargs)
@@ -2526,6 +2744,8 @@ async def pipeline_index_file(
     file_path: Path,
     track_id: str = None,
     admission_token: str | None = None,
+    doc_id: str | None = None,
+    chunking: "TextChunkingConfig | None" = None,
 ):
     """Index a file with track_id
 
@@ -2536,10 +2756,19 @@ async def pipeline_index_file(
         admission_token: the endpoint's pending-enqueue reservation, forwarded
             so the admission guard re-weights THAT token to the deduped count
             instead of counting this request twice (LR2 §9.2)
+        doc_id: optional caller-assigned document id, forwarded to
+            ``pipeline_enqueue_file`` (upload path only)
+        chunking: optional validated per-document chunking configuration,
+            forwarded unchanged to ``pipeline_enqueue_file``
     """
     try:
         success, _ = await pipeline_enqueue_file(
-            rag, file_path, track_id, admission_token=admission_token
+            rag,
+            file_path,
+            track_id,
+            admission_token=admission_token,
+            doc_id=doc_id,
+            chunking=chunking,
         )
         if success:
             await rag.apipeline_process_enqueue_documents()
@@ -3797,7 +4026,17 @@ async def run_scanning_process(
         with _ScanCandidateSpool(
             batch_size, _scan_spool_base_dir(rag)
         ) as candidate_spool:
-            for file_path in doc_manager.iter_new_files():
+            # Scan the input directory of the workspace this request resolved
+            # to (LIGHTRAG-WORKSPACE header), not necessarily the startup
+            # workspace's directory doc_manager is bound to — same resolution
+            # as /documents/clear. No header -> the default directory, the
+            # historical behavior. A lazily-created workspace's directory may
+            # not exist yet; creating it is the idempotent no-op case.
+            effective_input_dir = workspace_input_dir(
+                doc_manager, getattr(rag, "workspace", "")
+            )
+            effective_input_dir.mkdir(parents=True, exist_ok=True)
+            for file_path in doc_manager.iter_new_files(effective_input_dir):
                 discovered += 1
                 # Classifying a large tree can outlast the job lease; renewing here
                 # (time-based, a no-op most iterations) keeps the record from being
@@ -4335,11 +4574,17 @@ def create_document_routes(
     # Create combined auth dependency for document routes
     combined_auth = get_combined_auth_dependency(api_key)
 
+    # Per-request instance resolution: the LIGHTRAG-WORKSPACE header selects
+    # the LightRAG instance via app.state.rag_manager; without a manager the
+    # factory-provided default instance is used (see workspace_manager.py).
+    resolve_request_rag = make_rag_dependency(rag)
+
     @router.post(
         "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
     )
     async def scan_for_new_documents(
         managed_tasks: set = Depends(get_managed_background_tasks),
+        rag: LightRAG = resolve_request_rag,
     ):
         """
         Trigger the scanning process for new documents.
@@ -4709,7 +4954,10 @@ def create_document_routes(
         response_model=ScanJobStatusResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_scan_job_status(track_id: str):
+    async def get_scan_job_status(
+        track_id: str,
+        rag: LightRAG = resolve_request_rag,
+    ):
         """
         Report the bounded status of one scan job (LR2 §8.6).
 
@@ -4761,6 +5009,7 @@ def create_document_routes(
         cursor: Optional[str] = Query(
             None, description="next_cursor from a previous page (opaque)"
         ),
+        rag: LightRAG = resolve_request_rag,
     ):
         """
         List canonical source keys claimed by more than one primary document.
@@ -4829,6 +5078,7 @@ def create_document_routes(
     async def repair_source_conflict(
         payload: SourceConflictRepairRequest,
         http_request: Request,
+        rag: LightRAG = resolve_request_rag,
     ):
         """
         Settle one source conflict by naming the document that keeps the source.
@@ -5056,7 +5306,17 @@ def create_document_routes(
     async def upload_to_input_dir(
         managed_tasks: set = Depends(get_managed_background_tasks),
         file: UploadFile = File(...),
+        doc_id: Optional[str] = Form(None),
+        parser: Optional[str] = Form(None),
+        parse_method: Optional[str] = Form(None),
+        enable_image: Optional[str] = Form(None),
+        enable_table: Optional[str] = Form(None),
+        enable_equation: Optional[str] = Form(None),
+        skip_entity_extract: Optional[str] = Form(None),
+        embedding_dim: Optional[int] = Form(None),
+        chunking: Optional[str] = Form(None),
         http_request: Request = None,
+        rag: LightRAG = resolve_request_rag,
     ):
         """
         Upload a file to the input directory and index it.
@@ -5122,6 +5382,13 @@ def create_document_routes(
                 (see get_managed_background_tasks) — the reservation-holding work
                 runs as a tracked asyncio task, not a Starlette callback
             file (UploadFile): The file to be uploaded. It must have an allowed extension.
+            doc_id (str, optional): caller-assigned document id (multipart form
+                field). When provided, the pending_parse pipeline uses it as the
+                document's full_doc_id instead of ``md5(canonical file_path)``;
+                track_status / doc_status responses key off it. A workspace that
+                already holds this id returns 409, unless the existing document
+                is FAILED — then the failed record is deleted first and the
+                upload proceeds as a clean retry.
 
         Returns:
             InsertResponse: A response object containing the upload status and a message.
@@ -5150,8 +5417,48 @@ def create_document_routes(
             if not admission_adopted:
                 await _reserve_enqueue_slot(rag, enqueue_token)
 
-            # Sanitize filename to prevent Path Traversal attacks
-            safe_filename = sanitize_filename(file.filename, doc_manager.input_dir)
+            # Land the upload in the input directory of the workspace this
+            # request resolved to (LIGHTRAG-WORKSPACE header), not necessarily
+            # the startup workspace's directory doc_manager is bound to — same
+            # resolution as /documents/clear and /documents/scan. No header ->
+            # the default directory, the historical behavior. A lazily-created
+            # workspace's directory may not exist yet; create it up front so
+            # the same-name checks and the streaming write below share one root.
+            effective_input_dir = workspace_input_dir(
+                doc_manager, getattr(rag, "workspace", "")
+            )
+            effective_input_dir.mkdir(parents=True, exist_ok=True)
+
+            # Sanitize the caller's display filename first, then encode the
+            # per-document DataHub parser contract as a native parser hint.
+            # The latter is still a single literal basename and therefore
+            # goes through the same traversal checks and duplicate handling.
+            display_filename = file.filename or ""
+            chunking_config = _parse_upload_chunking(chunking)
+            sanitize_filename(display_filename, effective_input_dir)
+            safe_filename = _upload_filename_with_directives(
+                display_filename,
+                parser=parser,
+                parse_method=parse_method,
+                enable_image=enable_image,
+                enable_table=enable_table,
+                enable_equation=enable_equation,
+                skip_entity_extract=skip_entity_extract,
+            )
+            safe_filename = sanitize_filename(safe_filename, effective_input_dir)
+
+            if embedding_dim is not None:
+                actual_embedding_dim = getattr(
+                    getattr(rag, "embedding_func", None), "embedding_dim", None
+                )
+                if actual_embedding_dim is not None and int(embedding_dim) != int(actual_embedding_dim):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"embedding_dim={embedding_dim} 与当前运行时向量维度 "
+                            f"{actual_embedding_dim} 不一致"
+                        ),
+                    )
 
             try:
                 filename_supported = doc_manager.is_supported_file(safe_filename)
@@ -5187,7 +5494,7 @@ def create_document_routes(
                         f"File size not available in UploadFile for {safe_filename}, will check during streaming"
                     )
 
-            file_path = doc_manager.input_dir / safe_filename
+            file_path = effective_input_dir / safe_filename
 
             # Strict name pre-check.  Both the INPUT directory and doc_status
             # must be free of any same-canonical-basename record before we
@@ -5214,7 +5521,7 @@ def create_document_routes(
                 existing_input_file: Path | None = file_path
             else:
                 existing_input_file = find_existing_file_by_file_path(
-                    doc_manager.input_dir, canonical_filename
+                    effective_input_dir, canonical_filename
                 )
             if existing_input_file:
                 raise HTTPException(
@@ -5226,12 +5533,78 @@ def create_document_routes(
                     ),
                 )
 
+            # Optional caller-assigned doc id. Validated BEFORE any byte is
+            # written so a rejected id never leaves a file behind. The id
+            # becomes the document's full_doc_id end to end (pending_parse
+            # honors the enqueue ``ids`` override), so it must not collide
+            # with a live document in this workspace: an existing non-FAILED
+            # record is a 409 (same semantics as the same-name 409 above —
+            # delete the existing document first). A FAILED record is the
+            # retry case: it is removed via the sanctioned deletion path
+            # (which purges any staged chunks a mid-processing failure left
+            # behind) before the upload proceeds.
+            requested_doc_id = validate_custom_doc_id(doc_id)
+            if requested_doc_id is not None:
+                existing_by_id = await rag.doc_status.get_by_id(requested_doc_id)
+                if existing_by_id:
+                    existing_id_status = (
+                        get_doc_status_value(existing_by_id) or "unknown"
+                    )
+                    if existing_id_status != DocStatus.FAILED.value:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Document storage already contains doc_id "
+                                f"'{requested_doc_id}' (Status: {existing_id_status}). "
+                                "Delete the existing record before re-uploading."
+                            ),
+                        )
+                    retry_file_path = (
+                        existing_by_id.get("file_path")
+                        if isinstance(existing_by_id, dict)
+                        else None
+                    )
+                    deletion = await rag.adelete_by_doc_id(requested_doc_id)
+                    if deletion.status == "not_allowed":
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Cannot retire the failed document '{requested_doc_id}' "
+                                f"while the pipeline is busy: {deletion.message}"
+                            ),
+                        )
+                    if deletion.status == "fail":
+                        raise HTTPException(
+                            status_code=500,
+                            detail=(
+                                f"Failed to retire the failed document "
+                                f"'{requested_doc_id}' before re-upload: {deletion.message}"
+                            ),
+                        )
+                    if deletion.status == "success":
+                        # Best-effort: drop the stale source file / parsed
+                        # artifacts of the failed upload so a later scan
+                        # cannot re-ingest them under a hash id. Failures
+                        # here must not block the accepted retry.
+                        stale_path = deletion.file_path or retry_file_path
+                        _, stale_errors = delete_file_variants_by_file_path(
+                            effective_input_dir, stale_path
+                        )
+                        for stale_error in stale_errors:
+                            logger.warning(
+                                f"/documents/upload retry cleanup: {stale_error}"
+                            )
+                        logger.info(
+                            f"/documents/upload: retired failed document "
+                            f"'{requested_doc_id}' for caller-requested re-upload"
+                        )
+
             # Async streaming write with size check
             bytes_written = 0
             chunk_size = 1024 * 1024  # 1MB chunks
             needs_cleanup = False
 
-            upload_opener = upload_file_opener(doc_manager.input_dir)
+            upload_opener = upload_file_opener(effective_input_dir)
             out_file_context = aiofiles.open(file_path, "xb", opener=upload_opener)
 
             opened = False
@@ -5323,6 +5696,8 @@ def create_document_routes(
                         file_path,
                         track_id,
                         admission_token=enqueue_token,
+                        doc_id=requested_doc_id,
+                        chunking=chunking_config,
                     )
                 finally:
                     await _release_enqueue_slot(rag, enqueue_token)
@@ -5341,7 +5716,7 @@ def create_document_routes(
 
             return InsertResponse(
                 status="success",
-                message=f"File '{safe_filename}' uploaded successfully. Processing will continue in background.",
+                message=f"File '{display_filename}' uploaded successfully. Processing will continue in background.",
                 track_id=track_id,
             )
 
@@ -5367,6 +5742,7 @@ def create_document_routes(
         request: InsertTextRequest,
         managed_tasks: set = Depends(get_managed_background_tasks),
         http_request: Request = None,
+        rag: LightRAG = resolve_request_rag,
     ):
         """
         Insert text into the RAG system.
@@ -5497,6 +5873,7 @@ def create_document_routes(
         request: InsertTextsRequest,
         managed_tasks: set = Depends(get_managed_background_tasks),
         http_request: Request = None,
+        rag: LightRAG = resolve_request_rag,
     ):
         """
         Insert multiple texts into the RAG system.
@@ -5653,13 +6030,17 @@ def create_document_routes(
     @router.delete(
         "", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)]
     )
-    async def clear_documents():
+    async def clear_documents(
+        rag: LightRAG = resolve_request_rag,
+    ):
         """
         Clear all documents from the RAG system.
 
         This endpoint deletes all documents, entities, relationships, and files from the system.
         It uses the storage drop methods to properly clean up all data and removes all files
-        from the input directory.
+        from the input directory of the resolved workspace (``LIGHTRAG-WORKSPACE`` header),
+        including the parser artifact tree (``__parsed__/`` — sidecar and raw-bundle
+        directories), which is removed recursively.
 
         **Concurrency Constraint:**
         - Atomically reserves the destructive slot (sets ``busy=True``
@@ -5897,14 +6278,44 @@ def create_document_routes(
             deleted_files_count = 0
             file_errors_count = 0
 
-            for file_path in doc_manager.input_dir.glob("*"):
-                if file_path.is_file():
-                    try:
-                        file_path.unlink()
-                        deleted_files_count += 1
-                    except Exception as e:
-                        logger.error(f"Error deleting file {file_path}: {str(e)}")
-                        file_errors_count += 1
+            # The filesystem cleanup targets the workspace this request
+            # resolved to (LIGHTRAG-WORKSPACE header), not necessarily the
+            # startup workspace's directory doc_manager is bound to.
+            effective_input_dir = workspace_input_dir(
+                doc_manager, getattr(rag, "workspace", "")
+            )
+
+            if effective_input_dir.is_dir():
+                for file_path in effective_input_dir.glob("*"):
+                    if file_path.is_file():
+                        try:
+                            file_path.unlink()
+                            deleted_files_count += 1
+                        except Exception as e:
+                            logger.error(f"Error deleting file {file_path}: {str(e)}")
+                            file_errors_count += 1
+
+            # Parser artifact directories (``__parsed__/<base>.parsed``,
+            # ``<base>.mineru_raw``, ``<base>.docling_raw``,
+            # ``<base>.native_raw`` — see PARSED_ARTIFACT_DIR_SUFFIXES) all
+            # live under ``<input>/__parsed__/``; the top-level sweep above
+            # deliberately skips subdirectories, so without this a clear
+            # leaves every sidecar / raw bundle behind. Remove the whole
+            # tree; a missing directory is the idempotent no-op case.
+            deleted_artifact_dirs_count = 0
+            parsed_root = effective_input_dir / PARSED_DIR_NAME
+            if parsed_root.is_dir():
+                try:
+                    await asyncio.to_thread(shutil.rmtree, parsed_root)
+                    deleted_artifact_dirs_count = 1
+                    logger.info(
+                        f"/documents/clear: removed parser artifact directory {parsed_root}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Error deleting parser artifact directory {parsed_root}: {str(e)}"
+                    )
+                    file_errors_count += 1
 
             # Log file deletion results
             if file_errors_count > 0:
@@ -5921,10 +6332,16 @@ def create_document_routes(
             # Prepare final result message
             final_message = ""
             if errors:
-                final_message = f"Cleared documents with some errors. Deleted {deleted_files_count} files."
+                final_message = (
+                    f"Cleared documents with some errors. Deleted {deleted_files_count} files "
+                    f"and {deleted_artifact_dirs_count} parser artifact directories."
+                )
                 status = "partial_success"
             else:
-                final_message = f"All documents cleared successfully. Deleted {deleted_files_count} files."
+                final_message = (
+                    f"All documents cleared successfully. Deleted {deleted_files_count} files "
+                    f"and {deleted_artifact_dirs_count} parser artifact directories."
+                )
                 status = "success"
 
             # Log final result
@@ -5971,7 +6388,9 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
         response_model=PipelineStatusResponse,
     )
-    async def get_pipeline_status() -> PipelineStatusResponse:
+    async def get_pipeline_status(
+        rag: LightRAG = resolve_request_rag,
+    ) -> PipelineStatusResponse:
         """
         Get the current status of the document indexing pipeline.
 
@@ -6082,7 +6501,9 @@ def create_document_routes(
     @router.get(
         "", response_model=DocsStatusesResponse, dependencies=[Depends(combined_auth)]
     )
-    async def documents() -> DocsStatusesResponse:
+    async def documents(
+        rag: LightRAG = resolve_request_rag,
+    ) -> DocsStatusesResponse:
         """
         Get the status of all documents in the system. This endpoint is deprecated; use /documents/paginated instead.
         To prevent excessive resource consumption, a maximum of 1,000 records is returned.
@@ -6200,6 +6621,7 @@ def create_document_routes(
     async def delete_document(
         delete_request: DeleteDocRequest,
         managed_tasks: set = Depends(get_managed_background_tasks),
+        rag: LightRAG = resolve_request_rag,
     ) -> DeleteDocByIdResponse:
         """
         Delete documents and all their associated data by their IDs using background processing.
@@ -6323,7 +6745,10 @@ def create_document_routes(
         response_model=ClearCacheResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def clear_cache(request: ClearCacheRequest):
+    async def clear_cache(
+        request: ClearCacheRequest,
+        rag: LightRAG = resolve_request_rag,
+    ):
         """
         Clear all cache data from the LLM response cache storage.
 
@@ -6357,7 +6782,10 @@ def create_document_routes(
         response_model=TrackStatusResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_track_status(track_id: str) -> TrackStatusResponse:
+    async def get_track_status(
+        track_id: str,
+        rag: LightRAG = resolve_request_rag,
+    ) -> TrackStatusResponse:
         """
         Get the processing status of documents by tracking ID.
 
@@ -6433,6 +6861,7 @@ def create_document_routes(
     )
     async def get_documents_paginated(
         request: DocumentsRequest,
+        rag: LightRAG = resolve_request_rag,
     ) -> PaginatedDocsResponse:
         """
         Get documents with pagination support.
@@ -6612,7 +7041,9 @@ def create_document_routes(
         response_model=StatusCountsResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_document_status_counts() -> StatusCountsResponse:
+    async def get_document_status_counts(
+        rag: LightRAG = resolve_request_rag,
+    ) -> StatusCountsResponse:
         """
         Get counts of documents by status.
 
@@ -6673,6 +7104,7 @@ def create_document_routes(
     )
     async def reprocess_failed_documents(
         managed_tasks: set = Depends(get_managed_background_tasks),
+        rag: LightRAG = resolve_request_rag,
     ):
         """
         Reprocess existing failed, pending, or interrupted document records
@@ -6822,6 +7254,7 @@ def create_document_routes(
     )
     async def force_reset_recovery(
         request: ForceResetRecoveryRequest,
+        rag: LightRAG = resolve_request_rag,
     ) -> ForceResetRecoveryResponse:
         """Force-clear a ``recovery_required`` fence (UNSAFE, manual).
 
@@ -7000,7 +7433,9 @@ def create_document_routes(
         response_model=CancelPipelineResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def cancel_pipeline():
+    async def cancel_pipeline(
+        rag: LightRAG = resolve_request_rag,
+    ):
         """
         Request cancellation of the currently running pipeline.
 

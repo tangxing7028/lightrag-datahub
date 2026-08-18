@@ -112,7 +112,7 @@ def _current_api_mode() -> str:
 
 def _normalize_api_mode(mode: str) -> str:
     mode = str(mode or "").strip().lower()
-    return mode if mode in {"official", "local"} else DEFAULT_MINERU_API_MODE
+    return mode if mode in {"official", "local", "wrapper"} else DEFAULT_MINERU_API_MODE
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -147,6 +147,8 @@ def _current_endpoint_signature() -> str:
         )
     if mode == "local":
         return os.getenv("MINERU_LOCAL_ENDPOINT", "").strip().rstrip("/")
+    if mode == "wrapper":
+        return os.getenv("MINERU_WRAPPER_ENDPOINT", "").strip().rstrip("/")
     return ""
 
 
@@ -227,6 +229,11 @@ class MinerUParserOptions:
             ).strip()
             or DEFAULT_MINERU_LANGUAGE
         )
+        requested_parse_method = (
+            str(overrides.get("parse_method", "")).strip().lower()
+            if "parse_method" in overrides
+            else ""
+        )
         local_parse_method = (
             str(
                 overrides.get(
@@ -237,6 +244,17 @@ class MinerUParserOptions:
                 )
             ).strip()
             or DEFAULT_MINERU_LOCAL_PARSE_METHOD
+        )
+        if requested_parse_method:
+            local_parse_method = requested_parse_method
+        # The official API has no local form field, but it does expose the
+        # same OCR intent through ``is_ocr``.  Wrapper/local modes also use
+        # the explicit parse method below, so one upload contract has the
+        # same meaning across all MinerU backends.
+        is_ocr = (
+            requested_parse_method == "ocr"
+            if requested_parse_method
+            else _env_bool("MINERU_IS_OCR", DEFAULT_MINERU_IS_OCR)
         )
         local_start = _env_int(
             "MINERU_LOCAL_START_PAGE_ID", DEFAULT_MINERU_LOCAL_START_PAGE_ID
@@ -257,7 +275,7 @@ class MinerUParserOptions:
             enable_formula=_env_bool(
                 "MINERU_ENABLE_FORMULA", DEFAULT_MINERU_ENABLE_FORMULA
             ),
-            is_ocr=_env_bool("MINERU_IS_OCR", DEFAULT_MINERU_IS_OCR),
+            is_ocr=is_ocr,
             page_ranges=page_ranges,
             local_backend=(
                 os.getenv("MINERU_LOCAL_BACKEND", DEFAULT_MINERU_LOCAL_BACKEND).strip()
@@ -305,6 +323,18 @@ def mineru_options_signature(
                 or DEFAULT_MINERU_MODEL_VERSION,
                 "is_ocr": bool(is_ocr),
                 "page_ranges": str(page_ranges or "").strip(),
+            }
+        )
+    elif mode == "wrapper":
+        # The wrapper protocol sends backend/method (and the base language /
+        # table / formula options above) but has no image-analysis or
+        # page-bound knobs, so those stay out of its cache key.
+        payload.update(
+            {
+                "local_backend": str(local_backend or "").strip()
+                or DEFAULT_MINERU_LOCAL_BACKEND,
+                "local_parse_method": str(local_parse_method or "").strip()
+                or DEFAULT_MINERU_LOCAL_PARSE_METHOD,
             }
         )
     else:

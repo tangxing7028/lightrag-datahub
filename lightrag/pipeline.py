@@ -117,6 +117,12 @@ from lightrag.utils import (
     tolerant_load_json_dict,
     validate_file_path_security,
 )
+from lightrag.sidecar.artifact_store import (
+    ArtifactStoreError,
+    get_artifact_store,
+    rewrite_drawing_tag_paths,
+    upload_document_assets,
+)
 from lightrag.utils_pipeline import (
     # Re-exported through the pipeline namespace (not used by this module
     # directly): the parser layer resolves these as ``lightrag.pipeline.<name>``
@@ -144,6 +150,7 @@ from lightrag.utils_pipeline import (
     resolve_existing_doc_source,
     resolve_doc_file_path,
     resolve_doc_status_parse_engine,
+    sidecar_assets_dir_for_uri,
     source_candidate_set_lock,
     strip_lightrag_doc_prefix,
 )
@@ -680,18 +687,26 @@ class _PipelineMixin:
         Args:
             input: Single document string or list of document strings (can be empty when docs_format is pending_parse)
             ids: list of unique document IDs, if not provided, MD5 hash IDs will be generated (from content or file_path).
-                **Providing ``ids`` marks the SDK raw direct-insert path**
-                (:meth:`LightRAG.ainsert`) and takes precedence over
-                ``docs_format``: the documents are always enqueued as RAW
-                — sanitized verbatim content, no parse-worker deferral —
-                by design, not as an oversight. ``pending_parse`` is the
-                server upload path, which never passes ``ids``.
+                How explicit ids combine with ``docs_format``:
+
+                - ``docs_format="raw"`` (the default) + ``ids`` is the SDK
+                  raw direct-insert path (:meth:`LightRAG.ainsert`): the
+                  documents are enqueued as RAW — sanitized verbatim
+                  content, no parse-worker deferral.
+                - ``docs_format="pending_parse"`` + ``ids`` is the server
+                  upload path with caller-assigned doc ids: the files still
+                  go through the parse worker exactly as an id-less
+                  ``pending_parse`` enqueue, but the supplied id becomes the
+                  document's ``full_doc_id`` instead of
+                  ``md5(canonical_file_path)``. Filename-based dedup
+                  (in-batch and against ``doc_status``) is unchanged — it
+                  keys off ``file_path``, not the doc id.
             file_paths: list of file paths corresponding to each document, used for citation
             track_id: tracking ID for monitoring processing status
             docs_format: "raw" (default) or "pending_parse"; "pending_parse" defers
                 extraction to the parse worker (content may be empty and
-                content-dedup happens after parsing). Ignored when ``ids``
-                is provided (see ``ids`` above).
+                content-dedup happens after parsing). When combined with
+                ``ids`` the pending_parse path wins (see ``ids`` above).
             parse_engine: file extraction engine already used or target engine for pending_parse
             process_options: per-document processing options string (i/t/e/!/F/R/V/P);
                 accepted as a single string broadcast to every input or as a list
@@ -1055,24 +1070,28 @@ class _PipelineMixin:
             content_data["chunk_options"] = _chunk_options_at(index)
             contents[doc_id] = content_data
 
-        # ``ids`` outranks ``docs_format`` by design: explicit ids mark the
-        # SDK raw direct-insert path (ainsert), which always enqueues the
-        # sanitized body as RAW. pending_parse (server upload) never passes
-        # ids, so the two never legitimately combine.
-        if ids is not None:
+        # ``docs_format`` decides the ingestion path; ``ids`` only overrides
+        # the generated doc id within that path. pending_parse (server
+        # upload) defers parsing to the parse worker whether or not the
+        # caller supplied ids — an id-less pending_parse enqueue hashes the
+        # canonical file path, an id-bearing one uses the caller's id as the
+        # full_doc_id end to end. RAW + ids remains the SDK raw
+        # direct-insert path (ainsert): sanitized verbatim content, no
+        # parse-worker deferral.
+        if docs_format == FULL_DOCS_FORMAT_PENDING_PARSE:
+            for i, doc in enumerate(input):
+                _add_content(
+                    i,
+                    doc or "",
+                    FULL_DOCS_FORMAT_PENDING_PARSE,
+                )
+        elif ids is not None:
             for i, doc in enumerate(input):
                 cleaned_content = sanitize_text_for_encoding(doc)
                 _add_content(
                     i,
                     cleaned_content,
                     FULL_DOCS_FORMAT_RAW,
-                )
-        elif docs_format == FULL_DOCS_FORMAT_PENDING_PARSE:
-            for i, doc in enumerate(input):
-                _add_content(
-                    i,
-                    doc or "",
-                    FULL_DOCS_FORMAT_PENDING_PARSE,
                 )
         else:
             for i, doc in enumerate(input):
@@ -4849,6 +4868,21 @@ class _PipelineMixin:
                         ctx.pipeline_status, extraction_message, processing_message
                     )
 
+                # Artifact staging (object storage, env-gated): upload the
+                # sidecar assets and rewrite <drawing> path attributes to
+                # permanent URLs BEFORE the body below is derived, so chunking
+                # (and every downstream consumer) sees the final addresses.
+                # This must run after the ANALYZING stage — the VLM reads the
+                # LOCAL sidecar files — hence here, at the top of PROCESSING,
+                # which every parsed document passes through whether or not it
+                # had multimodal analysis. No-op when unconfigured or when the
+                # document has no sidecar assets. An upload failure raises and
+                # fails the document (unless ARTIFACT_UPLOAD_FAIL_OPEN=true) —
+                # a rerun is preferable to persisted dead links.
+                content_data = await self._stage_doc_artifacts_before_chunking(
+                    doc_id=doc_id, content_data=content_data
+                )
+
                 # The parsed body is no longer carried through q_analyze /
                 # q_process (it would pin large documents in memory). Re-read it
                 # from full_docs (already fetched into content_data above) and
@@ -5455,6 +5489,14 @@ class _PipelineMixin:
                     )
 
                     process_end_time = int(time.time())
+                    # Publish user-visible artifacts before PROCESSED. A
+                    # configured artifact store is part of the read contract;
+                    # an export failure must remain visible as ingest failure.
+                    await self._export_processed_doc_artifacts(
+                        doc_id=doc_id,
+                        chunk_ids=list(chunks.keys()),
+                        file_path=file_path,
+                    )
                     await self._upsert_doc_status_transition(
                         ctx=ctx,
                         doc_id=doc_id,
@@ -6064,6 +6106,163 @@ class _PipelineMixin:
                 missing_ok=True,
             )
         return content_hash
+
+    # ============================================================
+    # Artifact staging / export (object storage, env-gated)
+    # ============================================================
+
+    async def _stage_doc_artifacts_before_chunking(
+        self,
+        *,
+        doc_id: str,
+        content_data: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Upload sidecar assets to the object store; rewrite drawing paths.
+
+        Runs at the top of PROCESSING, after the analyze stage (which reads
+        the LOCAL sidecar files) and before the chunk source is derived, so
+        every parsed document is covered whether or not it went through
+        ANALYZING. The ``path`` attribute of every ``<drawing ... />`` tag in
+        the persisted ``full_docs`` body is replaced with the permanent URL
+        rendered from ``ARTIFACT_PUBLIC_URL_TEMPLATE``; all other attributes
+        are left untouched and the rewrite is idempotent (paths that are
+        already URLs are skipped), so a rerun simply re-uploads the same keys
+        and rewrites nothing.
+
+        Failure policy: an upload error fails the document (a rerun is
+        preferable to chunk text with dead links) unless
+        ``ARTIFACT_UPLOAD_FAIL_OPEN=true`` downgrades it to a warning. The
+        ``content_hash`` is deliberately NOT recomputed: it fingerprints the
+        parsed source body for dedup, and the URL rewrite is a presentation
+        concern that must not change dedup identity.
+
+        Returns the (possibly updated) ``content_data`` so the caller derives
+        the chunk source from the rewritten body.
+        """
+        store = get_artifact_store()
+        if store is None or not isinstance(content_data, dict):
+            return content_data
+        sidecar_uri = content_data.get("sidecar_location")
+        if not sidecar_uri:
+            return content_data
+        assets_dir = sidecar_assets_dir_for_uri(sidecar_uri)
+        if assets_dir is None or not assets_dir.is_dir():
+            return content_data
+
+        workspace = self.workspace or ""
+        try:
+            uploaded = await upload_document_assets(
+                store,
+                assets_dir=assets_dir,
+                workspace=workspace,
+                doc_id=doc_id,
+            )
+        except Exception as exc:
+            if store.config.fail_open:
+                logger.warning(
+                    f"[artifacts] asset upload failed for {doc_id} "
+                    f"(ARTIFACT_UPLOAD_FAIL_OPEN=true); continuing with local "
+                    f"drawing paths: {exc}"
+                )
+                return content_data
+            raise ArtifactStoreError(
+                f"artifact upload failed for {doc_id}: {exc}"
+            ) from exc
+
+        if not uploaded:
+            return content_data
+        content = content_data.get("content")
+        if not isinstance(content, str) or "<drawing" not in content:
+            return content_data
+        if not store.config.public_url_template:
+            logger.warning(
+                f"[artifacts] {doc_id}: uploaded {len(uploaded)} asset(s) but "
+                "ARTIFACT_PUBLIC_URL_TEMPLATE is unset; leaving <drawing> "
+                "paths unchanged"
+            )
+            return content_data
+
+        def _url_for(raw_path: str) -> str | None:
+            relpath = raw_path.replace("\\", "/")
+            if relpath.startswith("./"):
+                relpath = relpath[2:]
+            if relpath not in uploaded:
+                return None
+            return store.public_url(workspace, doc_id, relpath)
+
+        new_content, rewrite_count = rewrite_drawing_tag_paths(content, _url_for)
+        if rewrite_count == 0:
+            return content_data
+
+        updated = {**content_data, "content": new_content}
+        await self.full_docs.upsert({doc_id: updated})
+        await self.full_docs.index_done_callback()
+        logger.info(
+            f"[artifacts] {doc_id}: uploaded {len(uploaded)} asset(s), "
+            f"rewrote {rewrite_count} <drawing> path(s) to permanent URLs"
+        )
+        return updated
+
+    async def _export_processed_doc_artifacts(
+        self,
+        *,
+        doc_id: str,
+        chunk_ids: list[str],
+        file_path: str,
+    ) -> None:
+        """Export ``document.md`` and ``chunks.json`` for a PROCESSED doc.
+
+        ``document.md`` is the final full_docs body (post-rewrite, with the
+        lightrag marker stripped); ``chunks.json`` is
+        ``[{chunk_id, chunk_order_index, tokens, content}]`` sorted by
+        ``chunk_order_index``, read back from ``text_chunks`` via the
+        doc_status chunk-id list. Both land under the same object-key prefix
+        as the assets staged before chunking. When artifact storage is
+        configured, failures are raised so the caller can expose an unusable
+        artifact as an ingest failure instead of claiming full success.
+        """
+        store = get_artifact_store()
+        if store is None:
+            return
+        workspace = self.workspace or ""
+        try:
+            content_data = await self.full_docs.get_by_id(doc_id)
+            body = strip_lightrag_doc_prefix(
+                (content_data or {}).get("content"),
+                (content_data or {}).get("parse_format"),
+            )
+            await store.put_bytes(
+                store.object_key(workspace, doc_id, "document.md"),
+                body.encode("utf-8"),
+                "text/markdown; charset=utf-8",
+            )
+
+            rows = await self.text_chunks.get_by_ids(chunk_ids) if chunk_ids else []
+            items: list[dict[str, Any]] = []
+            for chunk_id, row in zip(chunk_ids, rows):
+                if not isinstance(row, dict):
+                    continue
+                items.append(
+                    {
+                        "chunk_id": chunk_id,
+                        "chunk_order_index": int(row.get("chunk_order_index") or 0),
+                        "tokens": int(row.get("tokens") or 0),
+                        "content": row.get("content") or "",
+                    }
+                )
+            items.sort(key=lambda item: item["chunk_order_index"])
+            await store.put_bytes(
+                store.object_key(workspace, doc_id, "chunks.json"),
+                json.dumps(items, ensure_ascii=False, indent=2).encode("utf-8"),
+                "application/json",
+            )
+            logger.info(
+                f"[artifacts] {doc_id}: exported document.md and "
+                f"chunks.json ({len(items)} chunk(s))"
+            )
+        except Exception as exc:
+            logger.error(f"[artifacts] export failed for {doc_id} ({file_path}): {exc}")
+            raise
 
     async def _mark_duplicate_after_parse(
         self,
