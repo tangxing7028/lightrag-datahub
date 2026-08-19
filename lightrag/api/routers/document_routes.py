@@ -5605,53 +5605,12 @@ def create_document_routes(
 
             file_path = effective_input_dir / safe_filename
 
-            # Strict name pre-check.  Both the INPUT directory and doc_status
-            # must be free of any same-canonical-basename record before we
-            # accept the upload.  Replacing an existing document requires an
-            # explicit DELETE first; we no longer write a "duplicated" 200
-            # response that silently no-ops.
-            existing_doc_data = await get_existing_doc_by_file_path_candidates(
-                rag.doc_status, file_path
-            )
-            if existing_doc_data:
-                status = get_doc_status_value(existing_doc_data) or "unknown"
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Document storage already contains '{safe_filename}' "
-                        f"(Status: {status}). Delete the existing record before re-uploading."
-                    ),
-                )
-
-            # INPUT directory check, using canonical parser-hint names.
-            # Fast path: exact filename match avoids iterdir on large input directories.
-            canonical_filename = normalize_file_path(safe_filename)
-            if file_path.exists():
-                existing_input_file: Path | None = file_path
-            else:
-                existing_input_file = find_existing_file_by_file_path(
-                    effective_input_dir, canonical_filename
-                )
-            if existing_input_file:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Input directory already contains a file with the same "
-                        f"canonical basename ('{existing_input_file.name}'). "
-                        f"Remove or rename it before re-uploading."
-                    ),
-                )
-
-            # Optional caller-assigned doc id. Validated BEFORE any byte is
-            # written so a rejected id never leaves a file behind. The id
-            # becomes the document's full_doc_id end to end (pending_parse
-            # honors the enqueue ``ids`` override), so it must not collide
-            # with a live document in this workspace: an existing non-FAILED
-            # record is a 409 (same semantics as the same-name 409 above —
-            # delete the existing document first). A FAILED record is the
-            # retry case: it is removed via the sanctioned deletion path
-            # (which purges any staged chunks a mid-processing failure left
-            # behind) before the upload proceeds.
+            # Optional caller-assigned doc id. Validate and retire an existing
+            # FAILED record before the canonical-name and input-file checks.
+            # A retry uses the same display filename, so checking the name
+            # first would reject the request before this sanctioned cleanup
+            # path could run. Requests without the original doc id retain the
+            # strict duplicate-name behavior below.
             requested_doc_id = validate_custom_doc_id(doc_id)
             if requested_doc_id is not None:
                 existing_by_id = await rag.doc_status.get_by_id(requested_doc_id)
@@ -5707,6 +5666,43 @@ def create_document_routes(
                             f"/documents/upload: retired failed document "
                             f"'{requested_doc_id}' for caller-requested re-upload"
                         )
+
+            # Strict name pre-check.  Both the INPUT directory and doc_status
+            # must be free of any same-canonical-basename record before we
+            # accept the upload.  Replacing an existing document requires an
+            # explicit DELETE first; we no longer write a "duplicated" 200
+            # response that silently no-ops.
+            existing_doc_data = await get_existing_doc_by_file_path_candidates(
+                rag.doc_status, file_path
+            )
+            if existing_doc_data:
+                status = get_doc_status_value(existing_doc_data) or "unknown"
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Document storage already contains '{safe_filename}' "
+                        f"(Status: {status}). Delete the existing record before re-uploading."
+                    ),
+                )
+
+            # INPUT directory check, using canonical parser-hint names.
+            # Fast path: exact filename match avoids iterdir on large input directories.
+            canonical_filename = normalize_file_path(safe_filename)
+            if file_path.exists():
+                existing_input_file: Path | None = file_path
+            else:
+                existing_input_file = find_existing_file_by_file_path(
+                    effective_input_dir, canonical_filename
+                )
+            if existing_input_file:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Input directory already contains a file with the same "
+                        f"canonical basename ('{existing_input_file.name}'). "
+                        f"Remove or rename it before re-uploading."
+                    ),
+                )
 
             # Async streaming write with size check
             bytes_written = 0
