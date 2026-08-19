@@ -33,7 +33,14 @@ def _make_chunks_vdb():
     return mock
 
 
-async def _run_search(monkeypatch, branches, mode="mix"):
+async def _run_search(
+    monkeypatch,
+    branches,
+    mode="mix",
+    *,
+    enable_summary_search=False,
+    doc_summaries_vdb=None,
+):
     """Run _perform_kg_search with the given fake branches patched in."""
     import lightrag.operate as operate
 
@@ -49,8 +56,11 @@ async def _run_search(monkeypatch, branches, mode="mix"):
         entities_vdb=MagicMock(),
         relationships_vdb=MagicMock(),
         text_chunks_db=_make_text_chunks_db(),
-        query_param=QueryParam(mode=mode, top_k=5),
+        query_param=QueryParam(
+            mode=mode, top_k=5, enable_summary_search=enable_summary_search
+        ),
         chunks_vdb=_make_chunks_vdb(),
+        doc_summaries_vdb=doc_summaries_vdb,
     )
 
 
@@ -170,3 +180,34 @@ async def test_disabled_branches_stay_disabled(monkeypatch):
         chunks_vdb=_make_chunks_vdb(),
     )
     assert sorted(called) == ["global", "local"]
+
+
+@pytest.mark.asyncio
+async def test_hybrid_summary_search_enables_vector_branch(monkeypatch):
+    """Summary-first retrieval must run inside the hybrid query path."""
+    called = []
+
+    async def fake_local(*args, **kwargs):
+        called.append("local")
+        return [], []
+
+    async def fake_global(*args, **kwargs):
+        called.append("global")
+        return [], []
+
+    async def fake_vector(*args, **kwargs):
+        called.append("vector")
+        assert kwargs["doc_summaries_vdb"] is summaries
+        return [{"content": "c", "chunk_id": "chunk-1"}]
+
+    summaries = MagicMock()
+    result = await _run_search(
+        monkeypatch,
+        {"local": fake_local, "global": fake_global, "vector": fake_vector},
+        mode="hybrid",
+        enable_summary_search=True,
+        doc_summaries_vdb=summaries,
+    )
+
+    assert sorted(called) == ["global", "local", "vector"]
+    assert [chunk["chunk_id"] for chunk in result["vector_chunks"]] == ["chunk-1"]

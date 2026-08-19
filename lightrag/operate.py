@@ -5184,8 +5184,15 @@ async def _perform_kg_search(
             branch_tasks["local"] = asyncio.create_task(_local_branch())
         if len(hl_keywords) > 0:
             branch_tasks["global"] = asyncio.create_task(_global_branch())
-        # Vector chunks are only retrieved for mix mode
-        if query_param.mode == "mix" and chunks_vdb:
+        # ``hybrid`` traditionally combines only the KG branches.  When the
+        # optional summary-first retrieval is enabled, it must also run the
+        # vector branch so the summary store can select document IDs before
+        # chunk retrieval.  Keep the existing hybrid behavior when the flag is
+        # off; ``mix`` always includes vector chunks.
+        if chunks_vdb and (
+            query_param.mode == "mix"
+            or (query_param.mode == "hybrid" and query_param.enable_summary_search)
+        ):
             branch_tasks["vector"] = asyncio.create_task(_vector_branch())
 
         branch_names = list(branch_tasks.keys())
