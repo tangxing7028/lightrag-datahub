@@ -126,6 +126,46 @@ async def _collect_async_bytes(stream: Any) -> bytes:
     return b"".join(chunks)
 
 
+@pytest.mark.offline
+async def test_wrapper_uses_configured_http_timeout(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow synchronous wrapper must use the parser timeout, not 120s."""
+    import lightrag.parser.external.mineru.client as mod
+
+    seen: dict[str, Any] = {}
+
+    def _record_timeout(*args: Any, **kwargs: Any) -> object:
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return object()
+
+    fake_httpx.Timeout = _record_timeout
+    monkeypatch.setenv("MINERU_API_MODE", "wrapper")
+    monkeypatch.setenv("MINERU_WRAPPER_ENDPOINT", "http://127.0.0.1:9014")
+    monkeypatch.setenv("REMOTE_PARSER_TIMEOUT", "480")
+    monkeypatch.delenv("MINERU_HTTP_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setenv("MINERU_CONNECT_TIMEOUT_SECONDS", "12")
+
+    class _WrapperDispatcher(_Dispatcher):
+        def post(self, url: str, **_: Any) -> _FakeResponse:
+            assert url == "http://127.0.0.1:9014/predict"
+            return _FakeResponse(text=json.dumps({"md": "# parsed"}))
+
+    source = tmp_path / "slow-wrapper.pdf"
+    source.write_bytes(b"PDF")
+    raw = tmp_path / "slow-wrapper.mineru_raw"
+    raw.mkdir()
+    _CURRENT.dispatcher = _WrapperDispatcher()
+
+    await mod.MinerURawClient().download_into(raw, source)
+
+    assert seen["args"] == (480.0,)
+    assert seen["kwargs"] == {"connect": 12.0}
+
+
 # ---------------------------------------------------------------------------
 # Common monkeypatch helpers
 # ---------------------------------------------------------------------------
@@ -308,7 +348,7 @@ async def test_client_official_mode_round_trip(
 
     dispatcher = _OfficialDispatcher()
     _CURRENT.dispatcher = dispatcher
-    manifest = await MinerURawClient().download_into(raw, src)
+    await MinerURawClient().download_into(raw, src)
 
     assert dispatcher.uploaded is True
     assert dispatcher.upload_headers == {"Content-Length": str(src.stat().st_size)}
@@ -316,6 +356,7 @@ async def test_client_official_mode_round_trip(
     assert dispatcher.apply_payload
     assert dispatcher.apply_payload["files"][0]["name"] == "demo.pdf"
     assert dispatcher.apply_payload["model_version"] == "vlm"
+    manifest = await MinerURawClient().download_into(raw, src)
     assert manifest.task_id == "B-1"
     assert manifest.api_mode == "official"
     assert manifest.endpoint_signature == "https://mineru.net"
@@ -1328,7 +1369,7 @@ async def test_client_wrapper_md_url_downloads_assets_with_traversal_guard(
 
     dispatcher = _WrapperMdUrlDispatcher()
     _CURRENT.dispatcher = dispatcher
-    manifest = await MinerURawClient().download_into(raw, src)
+    await MinerURawClient().download_into(raw, src)
 
     # Markdown lands at raw_dir root; relative assets under images/.
     assert (raw / "demo.md").read_text(encoding="utf-8") == WRAPPER_MD
