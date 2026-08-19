@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import os
 import re
 import shutil
@@ -64,6 +65,8 @@ OFFICIAL_FAILED_STATES = {"failed"}
 LOCAL_DONE_STATES = {"completed"}
 LOCAL_FAILED_STATES = {"failed"}
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+DEFAULT_MINERU_HTTP_TIMEOUT_SECONDS = 600.0
+DEFAULT_MINERU_CONNECT_TIMEOUT_SECONDS = 30.0
 
 # Markdown image references: ``![alt](path)`` and ``<img src="path">``.
 _MD_IMAGE_REF_RES = (
@@ -89,6 +92,23 @@ def _get_by_path(payload: Any, path: str) -> Any:
 
 def _strip_trailing_slash(url: str) -> str:
     return url.rstrip("/")
+
+
+def _positive_float_env(names: tuple[str, ...], default: float) -> float:
+    """Read a positive timeout, accepting the shared parser timeout alias."""
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            logger.warning("%s must be a positive number; using the next fallback", name)
+            continue
+        if math.isfinite(value) and value > 0:
+            return value
+        logger.warning("%s must be a positive number; using the next fallback", name)
+    return default
 
 
 def _resolve_upload_name(upload_name: str | None, source_file_path: Path) -> str:
@@ -123,6 +143,10 @@ class MinerURawClient:
     Construct once per call (cheap). Reads ``MINERU_*`` env vars at
     construction time. Methods are async and use a single shared httpx
     client across all calls in :meth:`download_into`.
+
+    ``MINERU_HTTP_TIMEOUT_SECONDS`` controls the complete request/read window.
+    ``REMOTE_PARSER_TIMEOUT`` is accepted as a fallback so the runtime can
+    share the parser timeout configured by ai-service.
 
     Implements the MinerU-specific upload + poll + zip download flow
     inline; bundle handling needs the ``result_url`` *and* the
@@ -191,6 +215,14 @@ class MinerURawClient:
         self.poll_interval = float(os.getenv("MINERU_POLL_INTERVAL_SECONDS", "2"))
         # 600 * 2s client-side sleep ≈ 20 min worst case; raise for very large PDFs.
         self.max_polls = int(os.getenv("MINERU_MAX_POLLS", "600"))
+        self.http_timeout_seconds = _positive_float_env(
+            ("MINERU_HTTP_TIMEOUT_SECONDS", "REMOTE_PARSER_TIMEOUT"),
+            DEFAULT_MINERU_HTTP_TIMEOUT_SECONDS,
+        )
+        self.connect_timeout_seconds = _positive_float_env(
+            ("MINERU_CONNECT_TIMEOUT_SECONDS",),
+            DEFAULT_MINERU_CONNECT_TIMEOUT_SECONDS,
+        )
         self.engine_version = os.getenv("MINERU_ENGINE_VERSION", "").strip()
 
         options = MinerUParserOptions.from_env(
@@ -234,7 +266,10 @@ class MinerURawClient:
         raw_dir.mkdir(parents=True, exist_ok=True)
         resolved_upload_name = _resolve_upload_name(upload_name, source_file_path)
 
-        timeout = httpx.Timeout(120.0, connect=30.0)
+        timeout = httpx.Timeout(
+            self.http_timeout_seconds,
+            connect=self.connect_timeout_seconds,
+        )
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 if self.api_mode == "official":
