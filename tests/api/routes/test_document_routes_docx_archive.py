@@ -343,6 +343,43 @@ class _DuplicateUploadRag:
         self.workspace = workspace or f"upload-test-{uuid4().hex}"
 
 
+class _RetryUploadDocStatus(_ScanDocStatus):
+    def __init__(self, docs_by_path, docs_by_id):
+        super().__init__(docs_by_path)
+        self.docs_by_id = docs_by_id
+
+    async def get_by_id(self, doc_id):
+        return self.docs_by_id.get(doc_id)
+
+
+class _RetryUploadRag:
+    def __init__(self, doc_id, row, workspace=None):
+        self.doc_status = _RetryUploadDocStatus(
+            {row["file_path"]: row},
+            {doc_id: row},
+        )
+        self.workspace = workspace or f"upload-retry-test-{uuid4().hex}"
+        self.deleted_doc_ids = []
+
+    async def adelete_by_doc_id(self, doc_id, delete_llm_cache=False):
+        self.deleted_doc_ids.append((doc_id, delete_llm_cache))
+        row = self.doc_status.docs_by_id.pop(doc_id, None)
+        if row is None:
+            return DeletionResult(
+                status="not_found",
+                doc_id=doc_id,
+                message="not found",
+                file_path="",
+            )
+        self.doc_status.docs_by_path.pop(row["file_path"], None)
+        return DeletionResult(
+            status="success",
+            doc_id=doc_id,
+            message="deleted",
+            file_path=row["file_path"],
+        )
+
+
 class _DeleteRag:
     def __init__(self, result):
         self.result = result
@@ -1245,6 +1282,67 @@ async def test_upload_rejects_same_name_failed_doc_status_without_full_docs(
     assert not (tmp_path / "failed.docx").exists()
 
 
+async def test_upload_retries_failed_doc_by_id_before_same_name_check(
+    tmp_path, monkeypatch
+):
+    """DataHub retries reuse the original doc_id and display filename.
+
+    The failed-record cleanup must happen before the canonical-name guard;
+    otherwise the retry is rejected with the same 409 that protects ordinary
+    duplicate uploads.
+    """
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://fake-mineru")
+    failed_doc_id = "doc-retry-1"
+    failed_file_path = "failed.[mineru-ite].docx"
+    failed_row = {
+        "status": DocStatus.FAILED.value,
+        "file_path": failed_file_path,
+        "track_id": "track-failed",
+    }
+    rag = _RetryUploadRag(failed_doc_id, failed_row)
+    doc_manager = DocumentManager(str(tmp_path))
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    managed_tasks = set()
+    calls = []
+
+    async def capture_pipeline(*args, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(_document_routes, "pipeline_index_file", capture_pipeline)
+    upload_file = _document_routes.UploadFile(
+        filename="failed.docx",
+        file=BytesIO(b"replacement docx bytes"),
+    )
+
+    response = await upload_endpoint(
+        managed_tasks=managed_tasks,
+        file=upload_file,
+        doc_id=failed_doc_id,
+        parser="mineru",
+        parse_method="auto",
+        enable_image="true",
+        enable_table="true",
+        enable_equation="true",
+        skip_entity_extract="false",
+        rag=rag,
+    )
+    await _await_managed(managed_tasks)
+
+    assert response.status == "success"
+    assert rag.deleted_doc_ids == [(failed_doc_id, False)]
+    assert len(calls) == 1
+    assert calls[0]["doc_id"] == failed_doc_id
+    assert any(path.name == failed_file_path for path in tmp_path.rglob("*"))
+
+
 async def test_upload_rejects_parser_hinted_filesystem_duplicate(tmp_path, monkeypatch):
     monkeypatch.setattr(
         _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
@@ -1464,7 +1562,7 @@ async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypat
     gate = asyncio.Event()
 
     async def _gated_index(
-        rag_arg, file_path, track_id=None, admission_token=None, doc_id=None
+        rag_arg, file_path, track_id=None, admission_token=None, doc_id=None, **kwargs
     ):
         await gate.wait()
 
@@ -1609,7 +1707,7 @@ async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatc
     gate = asyncio.Event()
 
     async def _gated_index(
-        rag_arg, file_path, track_id=None, admission_token=None, doc_id=None
+        rag_arg, file_path, track_id=None, admission_token=None, doc_id=None, **kwargs
     ):
         await gate.wait()
 
@@ -2544,7 +2642,7 @@ async def test_two_concurrent_uploads_both_succeed_when_pipeline_busy(
     gate = asyncio.Event()
 
     async def _gated_index(
-        rag_arg, file_path, track_id=None, admission_token=None, doc_id=None
+        rag_arg, file_path, track_id=None, admission_token=None, doc_id=None, **kwargs
     ):
         await gate.wait()
 
@@ -2959,7 +3057,7 @@ async def test_upload_managed_task_released_on_shutdown_drain(tmp_path, monkeypa
     gate = asyncio.Event()
 
     async def _gated_index(
-        rag_arg, file_path, track_id=None, admission_token=None, doc_id=None
+        rag_arg, file_path, track_id=None, admission_token=None, doc_id=None, **kwargs
     ):
         await gate.wait()
 
