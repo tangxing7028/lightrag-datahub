@@ -688,7 +688,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             ]
             description = "LightRAG relationships vector storage"
 
-        elif self.namespace.endswith("chunks"):
+        elif self.namespace.endswith("chunks") or self.namespace.endswith(
+            "doc_summaries"
+        ):
+            # doc_summaries mirrors the chunks shape: one vector row per
+            # document carrying the LLM-generated summary as ``content``.
             specific_fields = [
                 FieldSchema(
                     name="full_doc_id",
@@ -709,7 +713,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     nullable=True,
                 ),
             ]
-            description = "LightRAG chunks vector storage"
+            description = (
+                "LightRAG document summaries vector storage"
+                if self.namespace.endswith("doc_summaries")
+                else "LightRAG chunks vector storage"
+            )
 
         else:
             # Default generic schema (backward compatibility)
@@ -751,7 +759,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 "tgt_id": 512,
                 "source_id": MILVUS_MAX_VARCHAR_BYTES,
             }
-        if self.namespace.endswith("chunks"):
+        if self.namespace.endswith("chunks") or self.namespace.endswith(
+            "doc_summaries"
+        ):
             return {**base_fields, "full_doc_id": 64}
         return base_fields
 
@@ -766,7 +776,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 "content": MILVUS_MAX_VARCHAR_BYTES,
                 "source_id": MILVUS_MAX_VARCHAR_BYTES,
             }
-        if self.namespace.endswith("chunks"):
+        if self.namespace.endswith("chunks") or self.namespace.endswith(
+            "doc_summaries"
+        ):
             return {"content": MILVUS_MAX_VARCHAR_BYTES}
         return {}
 
@@ -1009,8 +1021,10 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                         )
                         self._create_scalar_index_fallback("tgt_id", "INVERTED")
 
-                elif self.namespace.endswith("chunks"):
-                    # Create indexes for chunk fields
+                elif self.namespace.endswith("chunks") or self.namespace.endswith(
+                    "doc_summaries"
+                ):
+                    # Create indexes for chunk / doc-summary fields
                     try:
                         doc_id_index = self._get_index_params()
                         doc_id_index.add_index(
@@ -1038,7 +1052,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 elif self.namespace.endswith("relationships"):
                     self._create_scalar_index_fallback("src_id", "INVERTED")
                     self._create_scalar_index_fallback("tgt_id", "INVERTED")
-                elif self.namespace.endswith("chunks"):
+                elif self.namespace.endswith("chunks") or self.namespace.endswith(
+                    "doc_summaries"
+                ):
                     self._create_scalar_index_fallback("full_doc_id", "INVERTED")
 
             logger.info(
@@ -1077,7 +1093,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 "source_id": {"type": "VarChar"},
                 "file_path": {"type": "VarChar"},
             }
-        elif self.namespace.endswith("chunks"):
+        elif self.namespace.endswith("chunks") or self.namespace.endswith(
+            "doc_summaries"
+        ):
             specific_fields = {
                 "full_doc_id": {"type": "VarChar"},
                 "content": {"type": "VarChar"},
@@ -2303,6 +2321,18 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 )
                 raise
 
+    async def probe_collection_exists(self) -> bool:
+        """True when the backing Milvus collection already exists.
+
+        Read-path probe for optional namespaces (e.g. doc_summaries): unlike
+        ``initialize()`` it never creates the collection, so a namespace that
+        was never written reports False instead of materializing an empty
+        collection.
+        """
+        if self._client is None:
+            self._client = self._create_milvus_client()
+        return bool(self._client.has_collection(self.final_namespace))
+
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         """Buffer vector docs for embedding and batched flush.
 
@@ -2345,7 +2375,12 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 self._pending_vector_docs[doc_id] = pdoc
 
     async def query(
-        self, query: str, top_k: int, query_embedding: list[float] = None
+        self,
+        query: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+        doc_ids: list[str] | None = None,
+        cosine_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
         """Similarity search against the persisted Milvus collection.
 
@@ -2354,6 +2389,26 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         embeds and writes them. Callers that need read-after-write visibility
         for similarity search must run an explicit flush first.
         """
+        filter_expr: str | None = None
+        if doc_ids is not None:
+            if "full_doc_id" in self.meta_fields:
+                # Fail closed without touching the server: an explicit empty
+                # allow-list authorizes zero documents, so zero results are
+                # returned (mirrors PGVectorStorage).
+                if len(doc_ids) == 0:
+                    return []
+                id_list = ", ".join(
+                    f'"{_escape_milvus_str(str(doc_id))}"' for doc_id in doc_ids
+                )
+                filter_expr = f"full_doc_id in [{id_list}]"
+            else:
+                # entities/relationships collections carry no full_doc_id
+                # column; keep the historical ignore-and-warn behavior there.
+                logger.warning(
+                    f"[{self.workspace}] MilvusVectorDBStorage namespace "
+                    f"'{self.namespace}' has no full_doc_id field; the doc_ids "
+                    "allow-list is not applied."
+                )
         # Ensure collection is loaded before querying
         self._ensure_collection_loaded()
 
@@ -2371,12 +2426,21 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         # Build search params from index config
         search_params_base = self.index_config.build_search_params()
 
+        # A query may override the storage-level threshold (for example, the
+        # knowledge-base retrieval setting forwarded by ai-service). Keep the
+        # default only when the request did not provide an override.
+        effective_threshold = (
+            self.cosine_better_than_threshold
+            if cosine_threshold is None
+            else cosine_threshold
+        )
+
         # Merge with metric type and radius threshold
         search_params = {
             "metric_type": self.index_config.metric_type,
             "params": {
                 **search_params_base.get("params", {}),
-                "radius": self.cosine_better_than_threshold,
+                "radius": effective_threshold,
             },
         }
 
@@ -2386,6 +2450,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             limit=top_k,
             output_fields=output_fields,
             search_params=search_params,
+            filter=filter_expr or "",
         )
         return [
             {

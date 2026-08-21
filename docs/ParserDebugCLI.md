@@ -98,7 +98,7 @@ python -m lightrag.parser.cli ./inputs/workspace/sample.pdf \
 
 The `mineru` / `docling` engines call external services when the **cache misses** (first parse or `--force-reparse`); the required environment variables are identical to production ingestion:
 
-- **MinerU**: `MINERU_API_MODE` (`local` / `official`), `MINERU_API_TOKEN`, `MINERU_LOCAL_ENDPOINT` or `MINERU_OFFICIAL_ENDPOINT`, optional `MINERU_ENGINE_VERSION` / `MINERU_MODEL_VERSION` / `MINERU_POLL_INTERVAL_SECONDS` / `MINERU_MAX_POLLS`.
+- **MinerU**: `MINERU_API_MODE` (`local` / `official`), `MINERU_API_TOKEN`, `MINERU_LOCAL_ENDPOINT` or `MINERU_OFFICIAL_ENDPOINT`, optional `MINERU_ENGINE_VERSION` / `MINERU_MODEL_VERSION` / `MINERU_POLL_INTERVAL_SECONDS` / `MINERU_MAX_POLLS` / `MINERU_HTTP_TIMEOUT_SECONDS` / `MINERU_CONNECT_TIMEOUT_SECONDS`. `REMOTE_PARSER_TIMEOUT` is accepted as the HTTP timeout fallback.
 - **Docling**: `DOCLING_ENDPOINT`, optional `DOCLING_ENGINE_VERSION` / `DOCLING_DO_OCR` / `DOCLING_FORCE_OCR` / `DOCLING_OCR_ENGINE` / `DOCLING_OCR_PRESET` / `DOCLING_OCR_LANG` / `DOCLING_DO_FORMULA_ENRICHMENT` / `DOCLING_POLL_INTERVAL_SECONDS` / `DOCLING_MAX_POLLS`.
 
 See [FileProcessingPipeline.md](./FileProcessingPipeline.md) for details.

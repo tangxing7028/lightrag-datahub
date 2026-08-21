@@ -1472,6 +1472,7 @@ class PostgreSQLDB:
             ("process_options", "TEXT NULL"),
             ("chunk_options", "JSONB NULL DEFAULT '{}'::jsonb"),
             ("parse_engine", "TEXT NULL"),
+            ("summary_options", "JSONB NULL DEFAULT '{}'::jsonb"),
         ]
         try:
             existing = await self.query(
@@ -1862,6 +1863,7 @@ class PostgreSQLDB:
         # with proper embedding model and dimension suffix for data isolation
         vector_tables_to_skip = {
             "LIGHTRAG_VDB_CHUNKS",
+            "LIGHTRAG_VDB_DOC_SUMMARIES",
             "LIGHTRAG_VDB_ENTITY",
             "LIGHTRAG_VDB_RELATION",
         }
@@ -2761,6 +2763,15 @@ class PGKVStorage(BaseKVStorage):
             if not isinstance(chunk_options, dict):
                 chunk_options = {}
             response["chunk_options"] = chunk_options
+            summary_options = response.get("summary_options")
+            if isinstance(summary_options, str):
+                try:
+                    summary_options = json.loads(summary_options)
+                except json.JSONDecodeError:
+                    summary_options = {}
+            if not isinstance(summary_options, dict):
+                summary_options = {}
+            response["summary_options"] = summary_options
 
         # Special handling for LLM cache to ensure compatibility with _get_cached_extraction_results
         if response and is_namespace(
@@ -2938,6 +2949,15 @@ class PGKVStorage(BaseKVStorage):
                 if not isinstance(chunk_options, dict):
                     chunk_options = {}
                 result["chunk_options"] = chunk_options
+                summary_options = result.get("summary_options")
+                if isinstance(summary_options, str):
+                    try:
+                        summary_options = json.loads(summary_options)
+                    except json.JSONDecodeError:
+                        summary_options = {}
+                if not isinstance(summary_options, dict):
+                    summary_options = {}
+                result["summary_options"] = summary_options
 
         # Special handling for LLM cache to ensure compatibility with _get_cached_extraction_results
         if results and is_namespace(
@@ -3105,7 +3125,7 @@ class PGKVStorage(BaseKVStorage):
             for i, (k, v) in enumerate(data.items(), start=1):
                 # Tuple order must match SQL: (id, content, doc_name, workspace,
                 #   sidecar_location, parse_format, content_hash, process_options,
-                #   chunk_options, parse_engine)
+                #   chunk_options, parse_engine, summary_options)
                 #
                 # All pipeline-derived fields pass through untouched so the
                 # SQL-level COALESCE guard in upsert_doc_full can distinguish
@@ -3126,6 +3146,7 @@ class PGKVStorage(BaseKVStorage):
                         v.get("process_options"),
                         json.dumps(v.get("chunk_options") or {}),
                         v.get("parse_engine"),
+                        json.dumps(v.get("summary_options") or {}),
                     )
                 )
                 await _cooperative_yield(i)
@@ -3538,6 +3559,31 @@ class PGVectorStorage(BaseVectorStorage):
             )
 
     @staticmethod
+    async def _pg_create_chunk_ids_gin_index(db: PostgreSQLDB, table_name: str) -> None:
+        """Create a GIN index on the ``chunk_ids`` array column.
+
+        Supports the document allow-list filter (``chunk_ids && ...``) used by
+        entity/relationship vector search. Only applies to the entity and
+        relationship vector tables, which are the ones carrying a ``chunk_ids``
+        column. Idempotent via IF NOT EXISTS.
+
+        Args:
+            db: PostgreSQLDB instance
+            table_name: Name of the vector table to index
+        """
+        index_name = _safe_index_name(table_name, "chunk_ids_gin")
+        try:
+            create_gin_index_sql = f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} USING gin (chunk_ids)"
+            logger.info(
+                f"PostgreSQL, Creating GIN index {index_name} on table {table_name}"
+            )
+            await db.execute(create_gin_index_sql)
+        except Exception as e:
+            logger.error(
+                f"PostgreSQL, Failed to create GIN index {index_name}, Got: {e}"
+            )
+
+    @staticmethod
     async def _pg_migrate_workspace_data(
         db: PostgreSQLDB,
         legacy_table_name: str,
@@ -3939,6 +3985,15 @@ class PGVectorStorage(BaseVectorStorage):
                 base_table=self.legacy_table_name,  # base_table for DDL template lookup
             )
 
+            # GIN index on chunk_ids for the document allow-list filter
+            # (entity/relationship tables only; idempotent).
+            if is_namespace(
+                self.namespace, NameSpace.VECTOR_STORE_ENTITIES
+            ) or is_namespace(self.namespace, NameSpace.VECTOR_STORE_RELATIONSHIPS):
+                await PGVectorStorage._pg_create_chunk_ids_gin_index(
+                    self.db, self.table_name
+                )
+
         if self._flush_lock is None:
             self._flush_lock = get_namespace_lock(
                 self.namespace, workspace=self.workspace
@@ -4030,6 +4085,25 @@ class PGVectorStorage(BaseVectorStorage):
             )
             raise
 
+        return upsert_sql, values
+
+    def _upsert_doc_summaries(
+        self, item: dict[str, Any], current_time: datetime.datetime
+    ) -> tuple[str, tuple[Any, ...]]:
+        """Prepare one per-document summary vector for PostgreSQL."""
+        upsert_sql = SQL_TEMPLATES["upsert_doc_summary"].format(
+            table_name=self.table_name
+        )
+        values: tuple[Any, ...] = (
+            self.workspace,  # $1
+            item["__id__"],  # $2
+            item["full_doc_id"],  # $3
+            item["content"],  # $4
+            item["__vector__"],  # $5
+            item.get("file_path"),  # $6
+            current_time,  # $7
+            current_time,  # $8
+        )
         return upsert_sql, values
 
     def _upsert_entities(
@@ -4263,7 +4337,9 @@ class PGVectorStorage(BaseVectorStorage):
                     await _cooperative_yield(i)
 
             # --- Build batch tuples ------------------------------------------
-            if is_namespace(self.namespace, NameSpace.VECTOR_STORE_CHUNKS):
+            if is_namespace(self.namespace, NameSpace.VECTOR_STORE_DOC_SUMMARIES):
+                build_tuple = self._upsert_doc_summaries
+            elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_CHUNKS):
                 build_tuple = self._upsert_chunks
             elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_ENTITIES):
                 build_tuple = self._upsert_entities
@@ -4416,8 +4492,18 @@ class PGVectorStorage(BaseVectorStorage):
 
     #################### query method ###############
     async def query(
-        self, query: str, top_k: int, query_embedding: list[float] = None
+        self,
+        query: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+        doc_ids: list[str] | None = None,
+        cosine_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
+        # Fail closed without touching the database: an explicit empty
+        # allow-list authorizes zero documents, so zero results are returned.
+        if doc_ids is not None and len(doc_ids) == 0:
+            return []
+
         if query_embedding is not None:
             embedding = query_embedding
         else:
@@ -4434,17 +4520,76 @@ class PGVectorStorage(BaseVectorStorage):
             if getattr(self.db, "vector_index_type", None) == "HNSW_HALFVEC"
             else "vector"
         )
-        sql = SQL_TEMPLATES[self.namespace].format(
-            table_name=self.table_name, vector_cast=vector_cast
+
+        # Per-query threshold override; None keeps the storage-level default.
+        effective_threshold = (
+            cosine_threshold
+            if cosine_threshold is not None
+            else self.cosine_better_than_threshold
         )
+
+        # Optional document allow-list filter, appended as an extra WHERE clause.
+        # The filter always binds as positional parameter $5 (after the fixed
+        # $1..$4 used by the base templates).
+        doc_filter = ""
         params = {
             "workspace": self.workspace,
-            "closer_than_threshold": 1 - self.cosine_better_than_threshold,
+            "closer_than_threshold": 1 - effective_threshold,
             "top_k": top_k,
             "embedding": embedding,
         }
+        if doc_ids is not None:
+            params["doc_ids"] = list(doc_ids)
+            if is_namespace(
+                self.namespace, NameSpace.VECTOR_STORE_CHUNKS
+            ) or is_namespace(self.namespace, NameSpace.VECTOR_STORE_DOC_SUMMARIES):
+                doc_filter = "AND full_doc_id = ANY($5)"
+            else:
+                # entities/relationships tables carry no full_doc_id column;
+                # restrict via their chunk_ids array overlapping the chunks
+                # that belong to authorized documents. The chunks table is
+                # derived from the same embedding model suffix as this table.
+                chunks_base_table = namespace_to_table_name(
+                    NameSpace.VECTOR_STORE_CHUNKS
+                )
+                chunks_table_name = (
+                    f"{chunks_base_table}_{self.model_suffix}"
+                    if self.model_suffix
+                    else chunks_base_table
+                )
+                doc_filter = (
+                    f"AND chunk_ids && (SELECT array_agg(id) FROM {chunks_table_name}"
+                    " WHERE workspace = $1 AND full_doc_id = ANY($5))"
+                )
+
+        sql = SQL_TEMPLATES[self.namespace].format(
+            table_name=self.table_name,
+            vector_cast=vector_cast,
+            doc_filter=doc_filter,
+        )
         results = await self.db.query(sql, params=list(params.values()), multirows=True)
         return results
+
+    async def get_doc_ids_by_chunk_ids(self, chunk_ids: list[str]) -> dict[str, str]:
+        """Resolve chunk IDs to their owning document IDs (``full_doc_id``).
+
+        Only meaningful on the chunks namespace table, which carries the
+        ``full_doc_id`` column. Returns an empty mapping for other namespaces.
+        """
+        if not chunk_ids:
+            return {}
+        if not is_namespace(self.namespace, NameSpace.VECTOR_STORE_CHUNKS):
+            return {}
+        sql = (
+            f"SELECT id, full_doc_id FROM {self.table_name}"
+            " WHERE workspace = $1 AND id = ANY($2)"
+        )
+        rows = await self.db.query(
+            sql, params=[self.workspace, list(chunk_ids)], multirows=True
+        )
+        if not rows:
+            return {}
+        return {row["id"]: row["full_doc_id"] for row in rows}
 
     async def index_done_callback(self) -> None:
         await self._flush_pending_vector_ops()
@@ -9015,6 +9160,7 @@ NAMESPACE_TABLE_MAP = {
     NameSpace.KV_STORE_RELATION_CHUNKS: "LIGHTRAG_RELATION_CHUNKS",
     NameSpace.KV_STORE_LLM_RESPONSE_CACHE: "LIGHTRAG_LLM_CACHE",
     NameSpace.VECTOR_STORE_CHUNKS: "LIGHTRAG_VDB_CHUNKS",
+    NameSpace.VECTOR_STORE_DOC_SUMMARIES: "LIGHTRAG_VDB_DOC_SUMMARIES",
     NameSpace.VECTOR_STORE_ENTITIES: "LIGHTRAG_VDB_ENTITY",
     NameSpace.VECTOR_STORE_RELATIONSHIPS: "LIGHTRAG_VDB_RELATION",
     NameSpace.DOC_STATUS: "LIGHTRAG_DOC_STATUS",
@@ -9047,6 +9193,7 @@ TABLES = {
                     process_options TEXT NULL,
                     chunk_options JSONB NULL DEFAULT '{}'::jsonb,
                     parse_engine TEXT NULL,
+                    summary_options JSONB NULL DEFAULT '{}'::jsonb,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
 	                CONSTRAINT LIGHTRAG_DOC_FULL_PK PRIMARY KEY (workspace, id)
@@ -9082,6 +9229,19 @@ TABLES = {
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
 	                CONSTRAINT LIGHTRAG_VDB_CHUNKS_PK PRIMARY KEY (workspace, id)
+                    )"""
+    },
+    "LIGHTRAG_VDB_DOC_SUMMARIES": {
+        "ddl": """CREATE TABLE LIGHTRAG_VDB_DOC_SUMMARIES (
+                    id VARCHAR(255),
+                    workspace VARCHAR(255),
+                    full_doc_id VARCHAR(256),
+                    content TEXT,
+                    content_vector VECTOR(dimension),
+                    file_path TEXT NULL,
+                    create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT LIGHTRAG_VDB_DOC_SUMMARIES_PK PRIMARY KEY (workspace, id)
                     )"""
     },
     "LIGHTRAG_VDB_ENTITY": {
@@ -9206,7 +9366,8 @@ SQL_TEMPLATES = {
                                 content_hash,
                                 process_options,
                                 COALESCE(chunk_options, '{}'::jsonb) as chunk_options,
-                                parse_engine
+                                parse_engine,
+                                COALESCE(summary_options, '{}'::jsonb) as summary_options
                                 FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id=$2
                             """,
     "get_by_id_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
@@ -9230,7 +9391,8 @@ SQL_TEMPLATES = {
                                  content_hash,
                                  process_options,
                                  COALESCE(chunk_options, '{}'::jsonb) as chunk_options,
-                                 parse_engine
+                                 parse_engine,
+                                 COALESCE(summary_options, '{}'::jsonb) as summary_options
                                  FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id = ANY($2)
                             """,
     "get_by_ids_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
@@ -9289,19 +9451,21 @@ SQL_TEMPLATES = {
                                 """,
     "filter_keys": "SELECT id FROM {table_name} WHERE workspace=$1 AND id IN ({ids})",
     # Pipeline-derived columns (sidecar_location / parse_format / content_hash /
-    # process_options / chunk_options / parse_engine) are guarded with COALESCE
+    # process_options / chunk_options / parse_engine / summary_options) are
+    # guarded with COALESCE
     # so a partial upsert (e.g. a caller writing only ``content`` + ``doc_name``)
     # does not silently overwrite metadata recorded by _persist_parsed_full_docs.
     # ``content`` and ``doc_name`` themselves are always overwritten — they are
     # the primary payload, never a candidate for preservation.
     # For the string columns we use NULLIF('', ...) so that an empty string from
     # a default-bearing caller is treated as "no value, preserve existing".
-    # For chunk_options (JSONB) we treat NULL or the empty-object literal as
-    # "no value, preserve existing".
+    # For JSONB fields we treat NULL or the empty-object literal as "no value,
+    # preserve existing".
     "upsert_doc_full": """INSERT INTO LIGHTRAG_DOC_FULL (id, content, doc_name, workspace,
                             sidecar_location, parse_format, content_hash,
-                            process_options, chunk_options, parse_engine)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                            process_options, chunk_options, parse_engine,
+                            summary_options)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                         ON CONFLICT (workspace,id) DO UPDATE
                            SET content = EXCLUDED.content,
                                doc_name = EXCLUDED.doc_name,
@@ -9331,6 +9495,12 @@ SQL_TEMPLATES = {
                                    NULLIF(EXCLUDED.parse_engine, ''),
                                    LIGHTRAG_DOC_FULL.parse_engine
                                ),
+                               summary_options = CASE
+                                   WHEN EXCLUDED.summary_options IS NULL
+                                     OR EXCLUDED.summary_options = '{}'::jsonb
+                                   THEN LIGHTRAG_DOC_FULL.summary_options
+                                   ELSE EXCLUDED.summary_options
+                               END,
                                update_time = CURRENT_TIMESTAMP
                        """,
     "upsert_llm_response_cache": """INSERT INTO LIGHTRAG_LLM_CACHE(workspace,id,original_prompt,return_value,chunk_id,cache_type,queryparam)
@@ -9403,7 +9573,17 @@ SQL_TEMPLATES = {
                       content_vector=EXCLUDED.content_vector,
                       file_path=EXCLUDED.file_path,
                       update_time = EXCLUDED.update_time
-                     """,
+                      """,
+    "upsert_doc_summary": """INSERT INTO {table_name} (workspace, id, full_doc_id,
+                       content, content_vector, file_path, create_time, update_time)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                       ON CONFLICT (workspace,id) DO UPDATE
+                       SET full_doc_id=EXCLUDED.full_doc_id,
+                       content=EXCLUDED.content,
+                       content_vector=EXCLUDED.content_vector,
+                       file_path=EXCLUDED.file_path,
+                       update_time=EXCLUDED.update_time
+                      """,
     "upsert_entity": """INSERT INTO {table_name} (workspace, id, entity_name, content,
                       content_vector, chunk_ids, file_path, create_time, update_time)
                       VALUES ($1, $2, $3, $4, $5, $6::varchar[], $7, $8, $9)
@@ -9434,6 +9614,7 @@ SQL_TEMPLATES = {
                      FROM {table_name}
                      WHERE workspace = $1
                        AND content_vector <=> $4::{vector_cast} < $2
+                       {doc_filter}
                      ORDER BY content_vector <=> $4::{vector_cast}
                      LIMIT $3;
                      """,
@@ -9443,6 +9624,7 @@ SQL_TEMPLATES = {
                 FROM {table_name}
                 WHERE workspace = $1
                   AND content_vector <=> $4::{vector_cast} < $2
+                  {doc_filter}
                 ORDER BY content_vector <=> $4::{vector_cast}
                 LIMIT $3;
                 """,
@@ -9454,6 +9636,20 @@ SQL_TEMPLATES = {
               FROM {table_name}
               WHERE workspace = $1
                 AND content_vector <=> $4::{vector_cast} < $2
+                {doc_filter}
+              ORDER BY content_vector <=> $4::{vector_cast}
+               LIMIT $3;
+               """,
+    "doc_summaries": """
+              SELECT id,
+                     full_doc_id,
+                     content,
+                     file_path,
+                     EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at
+              FROM {table_name}
+              WHERE workspace = $1
+                AND content_vector <=> $4::{vector_cast} < $2
+                {doc_filter}
               ORDER BY content_vector <=> $4::{vector_cast}
               LIMIT $3;
               """,

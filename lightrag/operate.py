@@ -93,6 +93,7 @@ from lightrag.constants import (
     DEFAULT_MAX_FILE_PATHS,
     DEFAULT_ENTITY_NAME_MAX_LENGTH,
     DEFAULT_ENTITY_NAME_MAX_BYTES,
+    DOC_SUMMARY_SEARCH_TOP_K,
 )
 from lightrag.kg.shared_storage import (
     PipelineStatusLogger,
@@ -4407,6 +4408,7 @@ async def kg_query(
     system_prompt: str | None = None,
     chunks_vdb: BaseVectorStorage = None,
     progress_callback: ProgressCallback | None = None,
+    doc_summaries_vdb: BaseVectorStorage | None = None,
 ) -> QueryResult | None:
     """
     Execute knowledge graph query and return unified QueryResult object.
@@ -4483,6 +4485,7 @@ async def kg_query(
         query_param,
         chunks_vdb,
         progress_callback=progress_callback,
+        doc_summaries_vdb=doc_summaries_vdb,
     )
 
     if context_result is None:
@@ -4875,11 +4878,75 @@ async def extract_keywords_only(
     return hl_keywords, ll_keywords
 
 
+async def _summary_search_doc_ids(
+    query: str,
+    doc_summaries_vdb: BaseVectorStorage | None,
+    query_param: QueryParam,
+    query_embedding: list[float] = None,
+) -> list[str] | None:
+    """First-stage doc-summary retrieval for ``enable_summary_search``.
+
+    Returns the matched ``full_doc_id`` list, or None to signal "fall back to
+    a regular full-corpus chunk retrieval" — covering every non-hit case:
+    feature unavailable on this backend, the summaries namespace not created
+    yet, a summary-stage backend error, or zero summary hits. Summary-stage
+    failures are deliberately swallowed (logged) so an optional pre-filter
+    can never turn a healthy chunk store into a failed query.
+    """
+    if doc_summaries_vdb is None:
+        logger.warning(
+            "[summary_search] enable_summary_search requested but no "
+            "doc-summaries store is configured for this workspace; falling "
+            "back to full retrieval"
+        )
+        return None
+    probe = getattr(doc_summaries_vdb, "probe_collection_exists", None)
+    try:
+        if callable(probe) and not await probe():
+            logger.info(
+                "[summary_search] doc-summaries namespace does not exist yet "
+                "(no document ever generated a summary); falling back to "
+                "full retrieval"
+            )
+            return None
+        results = await doc_summaries_vdb.query(
+            query,
+            top_k=DOC_SUMMARY_SEARCH_TOP_K,
+            query_embedding=query_embedding,
+            # Apply the caller's authorization scope during the first stage as
+            # well. Otherwise an unauthorized summary can consume one of the
+            # fixed three slots before the later intersection with chunks.
+            doc_ids=query_param.doc_ids,
+            cosine_threshold=query_param.cosine_threshold,
+        )
+    except Exception as exc:
+        logger.warning(
+            f"[summary_search] summary-stage retrieval failed ({exc}); "
+            "falling back to full retrieval"
+        )
+        return None
+    doc_ids: list[str] = []
+    for result in results or []:
+        full_doc_id = result.get("full_doc_id")
+        if full_doc_id and full_doc_id not in doc_ids:
+            doc_ids.append(full_doc_id)
+    if not doc_ids:
+        logger.info(
+            "[summary_search] no doc summary matched; falling back to full retrieval"
+        )
+        return None
+    logger.info(
+        f"[summary_search] {len(doc_ids)} doc(s) matched via summaries: {doc_ids}"
+    )
+    return doc_ids
+
+
 async def _get_vector_context(
     query: str,
     chunks_vdb: BaseVectorStorage,
     query_param: QueryParam,
     query_embedding: list[float] = None,
+    doc_summaries_vdb: BaseVectorStorage | None = None,
 ) -> list[dict]:
     """
     Retrieve text chunks from the vector database without reranking or truncation.
@@ -4892,6 +4959,8 @@ async def _get_vector_context(
         chunks_vdb: Vector database containing document chunks
         query_param: Query parameters including chunk_top_k and ids
         query_embedding: Optional pre-computed query embedding to avoid redundant embedding calls
+        doc_summaries_vdb: Optional per-document summary store (DataHub fork);
+            consulted first when ``query_param.enable_summary_search`` is set.
 
     Returns:
         List of text chunks with metadata
@@ -4905,8 +4974,26 @@ async def _get_vector_context(
     search_top_k = query_param.chunk_top_k or query_param.top_k
     cosine_threshold = chunks_vdb.cosine_better_than_threshold
 
+    doc_ids = query_param.doc_ids
+    if query_param.enable_summary_search:
+        summary_doc_ids = await _summary_search_doc_ids(
+            query, doc_summaries_vdb, query_param, query_embedding
+        )
+        if summary_doc_ids:
+            if doc_ids is not None:
+                # Both a caller allow-list and summary hits: intersect so the
+                # fail-closed allow-list semantics are preserved.
+                allowed = set(doc_ids)
+                doc_ids = [d for d in summary_doc_ids if d in allowed]
+            else:
+                doc_ids = summary_doc_ids
+
     results = await chunks_vdb.query(
-        query, top_k=search_top_k, query_embedding=query_embedding
+        query,
+        top_k=search_top_k,
+        query_embedding=query_embedding,
+        doc_ids=doc_ids,
+        cosine_threshold=query_param.cosine_threshold,
     )
     if not results:
         logger.info(
@@ -4943,6 +5030,7 @@ async def _perform_kg_search(
     query_param: QueryParam,
     chunks_vdb: BaseVectorStorage = None,
     progress_callback: ProgressCallback | None = None,
+    doc_summaries_vdb: BaseVectorStorage | None = None,
 ) -> dict[str, Any]:
     """
     Pure search logic that retrieves raw entities, relations, and vector chunks.
@@ -5027,6 +5115,7 @@ async def _perform_kg_search(
             entities_vdb,
             query_param,
             query_embedding=ll_embedding,
+            chunks_vdb=chunks_vdb,
         )
 
     elif query_param.mode == "global" and len(hl_keywords) > 0:
@@ -5041,20 +5130,37 @@ async def _perform_kg_search(
         )
 
     else:  # hybrid or mix mode
-        if len(ll_keywords) > 0:
+        # The local (entities), global (relationships) and vector-chunk
+        # branches have no data dependencies on each other, so run them
+        # concurrently.
+        #
+        # Progress events: each branch emits its own event when it starts,
+        # so events from concurrent branches may interleave and their
+        # relative order is not guaranteed. They are informational only.
+        #
+        # Failure semantics: gather is used WITHOUT return_exceptions —
+        # the first branch failure must abort the whole search rather than
+        # silently degrade to partial context. Plain gather() lets the
+        # remaining tasks keep running after the first exception, so on any
+        # error (including cancellation of the outer coroutine) the
+        # surviving branch tasks are explicitly cancelled and awaited
+        # before the exception propagates.
+        async def _local_branch():
             if progress_callback:
                 await progress_callback(QueryProgress.RETRIEVING_ENTITIES)
-            local_entities, local_relations = await _get_node_data(
+            return await _get_node_data(
                 ll_keywords,
                 knowledge_graph_inst,
                 entities_vdb,
                 query_param,
                 query_embedding=ll_embedding,
+                chunks_vdb=chunks_vdb,
             )
-        if len(hl_keywords) > 0:
+
+        async def _global_branch():
             if progress_callback:
                 await progress_callback(QueryProgress.RETRIEVING_RELATIONS)
-            global_relations, global_entities = await _get_edge_data(
+            return await _get_edge_data(
                 hl_keywords,
                 knowledge_graph_inst,
                 relationships_vdb,
@@ -5062,16 +5168,51 @@ async def _perform_kg_search(
                 query_embedding=hl_embedding,
             )
 
-        # Get vector chunks for mix mode
-        if query_param.mode == "mix" and chunks_vdb:
+        async def _vector_branch():
             if progress_callback:
                 await progress_callback(QueryProgress.RETRIEVING_CHUNKS)
-            vector_chunks = await _get_vector_context(
+            return await _get_vector_context(
                 query,
                 chunks_vdb,
                 query_param,
                 query_embedding,
+                doc_summaries_vdb=doc_summaries_vdb,
             )
+
+        branch_tasks: dict[str, asyncio.Task] = {}
+        if len(ll_keywords) > 0:
+            branch_tasks["local"] = asyncio.create_task(_local_branch())
+        if len(hl_keywords) > 0:
+            branch_tasks["global"] = asyncio.create_task(_global_branch())
+        # ``hybrid`` traditionally combines only the KG branches.  When the
+        # optional summary-first retrieval is enabled, it must also run the
+        # vector branch so the summary store can select document IDs before
+        # chunk retrieval.  Keep the existing hybrid behavior when the flag is
+        # off; ``mix`` always includes vector chunks.
+        if chunks_vdb and (
+            query_param.mode == "mix"
+            or (query_param.mode == "hybrid" and query_param.enable_summary_search)
+        ):
+            branch_tasks["vector"] = asyncio.create_task(_vector_branch())
+
+        branch_names = list(branch_tasks.keys())
+        try:
+            branch_results = await asyncio.gather(*branch_tasks.values())
+        except BaseException:
+            for task in branch_tasks.values():
+                task.cancel()
+            # Drain the cancelled tasks so none are left running (or
+            # logging "exception never retrieved") after we re-raise.
+            await asyncio.gather(*branch_tasks.values(), return_exceptions=True)
+            raise
+        results_by_branch = dict(zip(branch_names, branch_results))
+
+        if "local" in results_by_branch:
+            local_entities, local_relations = results_by_branch["local"]
+        if "global" in results_by_branch:
+            global_relations, global_entities = results_by_branch["global"]
+        if "vector" in results_by_branch:
+            vector_chunks = results_by_branch["vector"]
             # Track vector chunks with source metadata
             for i, chunk in enumerate(vector_chunks):
                 chunk_id = chunk.get("chunk_id") or chunk.get("id")
@@ -5666,6 +5807,7 @@ async def _build_query_context(
     query_param: QueryParam,
     chunks_vdb: BaseVectorStorage = None,
     progress_callback: ProgressCallback | None = None,
+    doc_summaries_vdb: BaseVectorStorage | None = None,
 ) -> QueryContextResult | None:
     """
     Main query context building function using the new 4-stage architecture:
@@ -5690,6 +5832,7 @@ async def _build_query_context(
         query_param,
         chunks_vdb,
         progress_callback=progress_callback,
+        doc_summaries_vdb=doc_summaries_vdb,
     )
 
     if not search_result["final_entities"] and not search_result["final_relations"]:
@@ -5784,13 +5927,18 @@ async def _get_node_data(
     entities_vdb: BaseVectorStorage,
     query_param: QueryParam,
     query_embedding=None,
+    chunks_vdb: BaseVectorStorage = None,
 ):
     logger.info(
         f"Query nodes: {query} (top_k:{query_param.top_k}, cosine:{entities_vdb.cosine_better_than_threshold})"
     )
 
     results = await entities_vdb.query(
-        query, top_k=query_param.top_k, query_embedding=query_embedding
+        query,
+        top_k=query_param.top_k,
+        query_embedding=query_embedding,
+        doc_ids=query_param.doc_ids,
+        cosine_threshold=query_param.cosine_threshold,
     )
 
     if not len(results):
@@ -5827,6 +5975,7 @@ async def _get_node_data(
         node_datas,
         query_param,
         knowledge_graph_inst,
+        chunks_vdb=chunks_vdb,
     )
 
     logger.info(
@@ -5842,6 +5991,7 @@ async def _find_most_related_edges_from_entities(
     node_datas: list[dict],
     query_param: QueryParam,
     knowledge_graph_inst: BaseGraphStorage,
+    chunks_vdb: BaseVectorStorage = None,
 ):
     node_names = [dp["entity_name"] for dp in node_datas]
     batch_edges_dict = await knowledge_graph_inst.get_nodes_edges_batch(node_names)
@@ -5886,6 +6036,48 @@ async def _find_most_related_edges_from_entities(
                 **edge_props,
             }
             all_edges_data.append(combined)
+
+    # Document allow-list filtering for graph-expansion edges. Edges carry no
+    # document ownership of their own, only the source chunk IDs in their
+    # ``source_id`` attribute; resolve those chunks to full_doc_id via the
+    # chunks vector table and drop edges whose sources lie entirely outside
+    # the authorized set. Fail-closed: an empty allow-list, an edge without
+    # source chunks, or an unresolvable chunk mapping all drop the edge.
+    if query_param.doc_ids is not None and all_edges_data:
+        authorized_doc_ids = set(query_param.doc_ids)
+        candidate_chunk_ids = set()
+        for edge in all_edges_data:
+            source_id = edge.get("source_id")
+            if source_id:
+                candidate_chunk_ids.update(
+                    split_string_by_multi_markers(source_id, [GRAPH_FIELD_SEP])
+                )
+        chunk_doc_map = {}
+        if candidate_chunk_ids and chunks_vdb is not None:
+            chunk_doc_map = await chunks_vdb.get_doc_ids_by_chunk_ids(
+                list(candidate_chunk_ids)
+            )
+
+        filtered_edges = []
+        for edge in all_edges_data:
+            source_id = edge.get("source_id")
+            edge_chunk_ids = (
+                split_string_by_multi_markers(source_id, [GRAPH_FIELD_SEP])
+                if source_id
+                else []
+            )
+            if any(
+                chunk_doc_map.get(chunk_id) in authorized_doc_ids
+                for chunk_id in edge_chunk_ids
+            ):
+                filtered_edges.append(edge)
+        dropped_count = len(all_edges_data) - len(filtered_edges)
+        if dropped_count:
+            logger.info(
+                f"doc_ids filter: dropped {dropped_count} graph-expansion edges "
+                "outside the authorized document set"
+            )
+        all_edges_data = filtered_edges
 
     all_edges_data = sorted(
         all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
@@ -6065,7 +6257,11 @@ async def _get_edge_data(
     )
 
     results = await relationships_vdb.query(
-        keywords, top_k=query_param.top_k, query_embedding=query_embedding
+        keywords,
+        top_k=query_param.top_k,
+        query_embedding=query_embedding,
+        doc_ids=query_param.doc_ids,
+        cosine_threshold=query_param.cosine_threshold,
     )
 
     if not len(results):
@@ -6383,6 +6579,7 @@ async def naive_query(
     system_prompt: str | None = None,
     text_chunks_db: BaseKVStorage | None = None,
     progress_callback: ProgressCallback | None = None,
+    doc_summaries_vdb: BaseVectorStorage | None = None,
 ) -> QueryResult | None:
     """
     Execute naive query and return unified QueryResult object.
@@ -6394,6 +6591,8 @@ async def naive_query(
         global_config: Global configuration
         hashing_kv: Cache storage
         system_prompt: System prompt
+        doc_summaries_vdb: Optional per-document summary store, consulted
+            first when ``query_param.enable_summary_search`` is set.
 
     Returns:
         QueryResult | None: Unified query result object containing:
@@ -6421,7 +6620,9 @@ async def naive_query(
 
     if progress_callback:
         await progress_callback(QueryProgress.RETRIEVING_CHUNKS)
-    chunks = await _get_vector_context(query, chunks_vdb, query_param, None)
+    chunks = await _get_vector_context(
+        query, chunks_vdb, query_param, None, doc_summaries_vdb=doc_summaries_vdb
+    )
 
     if chunks is None or len(chunks) == 0:
         logger.info(

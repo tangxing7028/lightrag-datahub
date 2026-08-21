@@ -208,7 +208,7 @@ def test_classification_failure_marks_the_job_failed_with_an_error_sample(tmp_pa
 
         doc_manager = DocumentManager(str(tmp_path))
 
-        def _boom():
+        def _boom(*_args):
             raise RuntimeError("classification boom")
 
         doc_manager.iter_new_files = _boom
@@ -244,7 +244,7 @@ def test_cancelled_scan_marks_the_job_cancelled(tmp_path):
 
         doc_manager = DocumentManager(str(tmp_path))
 
-        def _cancelled():
+        def _cancelled(*_args):
             raise asyncio.CancelledError()
 
         doc_manager.iter_new_files = _cancelled

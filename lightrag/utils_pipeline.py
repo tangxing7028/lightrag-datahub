@@ -364,6 +364,10 @@ KG_RECOVERY_WARNINGS_METADATA_KEY = "kg_recovery_warnings"
 _DOC_STATUS_METADATA_CARRY_OVER_KEYS: tuple[str, ...] = (
     "process_options",
     "source_file",
+    # DataHub fork: upload-time summary opt-in (mirrors the authoritative
+    # full_docs.summary_options); must survive every stage transition so a
+    # retried document still gets its summary.
+    "enable_summary",
     "parse_warnings",
     "chunk_opts",
     "parse_start_time",
@@ -586,6 +590,9 @@ def doc_status_transition_metadata(
 _DOC_STATUS_METADATA_DIRECTIVE_KEYS: tuple[str, ...] = (
     "process_options",
     "source_file",
+    # DataHub fork: the upload-time summary opt-in rides every reset exactly
+    # like process_options — the retry must regenerate the summary too.
+    "enable_summary",
     # Defense in depth: journaled custom-chunk patch rows are excluded from
     # pipeline processing/reset entirely, but if one ever reaches a reset the
     # journal must survive — stripping it would orphan the operation's staged
@@ -1200,9 +1207,14 @@ def sidecar_uri_for(parsed_artifact_dir: Path | str) -> str:
 
     The result always ends with ``/`` so a reader can distinguish a directory
     from a file at the URI level. Non-ASCII characters are percent-encoded.
+    Windows drive paths are emitted in the standard ``file:///C:/...`` form
+    (POSIX style with a leading slash before the drive letter) so the URI
+    authority component never swallows the drive.
     """
     p = Path(parsed_artifact_dir).resolve()
-    encoded = quote(str(p), safe="/")
+    encoded = quote(p.as_posix(), safe="/")
+    if not encoded.startswith("/"):
+        encoded = f"/{encoded}"
     return f"file://{encoded}/"
 
 
@@ -1220,6 +1232,11 @@ def resolve_sidecar_uri(uri: str | None) -> Path | None:
     path_str = unquote(parts.path)
     if path_str.endswith("/") and len(path_str) > 1:
         path_str = path_str[:-1]
+    # ``file:///C:/...`` — drop the leading slash before a Windows drive
+    # letter so Path() sees a rooted drive path instead of ``/C:/...``.
+    drive_match = re.match(r"^/([A-Za-z]):(/|$)", path_str)
+    if drive_match:
+        path_str = path_str[1:]
     return Path(path_str)
 
 

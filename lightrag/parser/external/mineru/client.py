@@ -8,23 +8,32 @@ final parser bundle on disk under ``raw_dir/``:
 - ``local`` — self-hosted ``mineru-api`` / ``mineru-router``: submit
   ``POST /tasks``, poll ``GET /tasks/{task_id}``, download
   ``GET /tasks/{task_id}/result``.
+- ``wrapper`` — custom wrapper service: single synchronous
+  ``POST {endpoint}/predict`` with a base64 JSON body. The response delivers
+  the parse result as (in priority order) a ``package_url`` zip bundle, an
+  inline ``content_list`` array, or markdown (inline ``md`` / ``markdown`` /
+  ``md_content`` or a downloadable ``md_url``).
 
-Both protocols request a zip result bundle. Archives are extracted under
-``raw_dir/`` and normalized so the adapter can read a root-level
-``content_list.json``.
+The official and local protocols request a zip result bundle. Archives are
+extracted under ``raw_dir/`` and normalized so the adapter can read a
+root-level ``content_list.json``; the wrapper mode normalizes every delivery
+shape onto the same on-disk contract.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import math
 import os
+import re
 import shutil
 from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 from lightrag.parser.external._common import raise_for_status_with_detail
 from lightrag.parser.external._zip import result_bundle_limits, safe_extract_zip
@@ -50,12 +59,21 @@ else:
 CONTENT_LIST_FILENAME = "content_list.json"
 DEFAULT_MINERU_API_MODE = "local"
 DEFAULT_MINERU_OFFICIAL_ENDPOINT = "https://mineru.net"
-VALID_MINERU_API_MODES = {"official", "local"}
+VALID_MINERU_API_MODES = {"official", "local", "wrapper"}
 OFFICIAL_DONE_STATES = {"done"}
 OFFICIAL_FAILED_STATES = {"failed"}
 LOCAL_DONE_STATES = {"completed"}
 LOCAL_FAILED_STATES = {"failed"}
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+DEFAULT_MINERU_HTTP_TIMEOUT_SECONDS = 600.0
+DEFAULT_MINERU_CONNECT_TIMEOUT_SECONDS = 30.0
+
+# Markdown image references: ``![alt](path)`` and ``<img src="path">``.
+_MD_IMAGE_REF_RES = (
+    re.compile(r"!\[[^\]]*\]\(([^)]+)\)"),
+    re.compile(r"<img\b[^>]*\bsrc=[\"']([^\"']+)[\"']", re.IGNORECASE),
+)
+_ABSOLUTE_REF_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 
 
 def _get_by_path(payload: Any, path: str) -> Any:
@@ -74,6 +92,23 @@ def _get_by_path(payload: Any, path: str) -> Any:
 
 def _strip_trailing_slash(url: str) -> str:
     return url.rstrip("/")
+
+
+def _positive_float_env(names: tuple[str, ...], default: float) -> float:
+    """Read a positive timeout, accepting the shared parser timeout alias."""
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            logger.warning("%s must be a positive number; using the next fallback", name)
+            continue
+        if math.isfinite(value) and value > 0:
+            return value
+        logger.warning("%s must be a positive number; using the next fallback", name)
+    return default
 
 
 def _resolve_upload_name(upload_name: str | None, source_file_path: Path) -> str:
@@ -109,6 +144,10 @@ class MinerURawClient:
     construction time. Methods are async and use a single shared httpx
     client across all calls in :meth:`download_into`.
 
+    ``MINERU_HTTP_TIMEOUT_SECONDS`` controls the complete request/read window.
+    ``REMOTE_PARSER_TIMEOUT`` is accepted as a fallback so the runtime can
+    share the parser timeout configured by ai-service.
+
     Implements the MinerU-specific upload + poll + zip download flow
     inline; bundle handling needs the ``result_url`` *and* the
     ``Content-Type`` of the response, which a generic protocol helper
@@ -135,6 +174,9 @@ class MinerURawClient:
         self.local_endpoint = _strip_trailing_slash(
             os.getenv("MINERU_LOCAL_ENDPOINT", "").strip()
         )
+        self.wrapper_endpoint = _strip_trailing_slash(
+            os.getenv("MINERU_WRAPPER_ENDPOINT", "").strip()
+        )
         self.api_token = os.getenv("MINERU_API_TOKEN", "").strip()
         if self.api_mode == "official":
             if not self.api_token:
@@ -158,9 +200,29 @@ class MinerURawClient:
                 ("/tasks", "/file_parse", "/health"),
             )
             self.endpoint = self.local_endpoint
+        elif self.api_mode == "wrapper":
+            if not self.wrapper_endpoint:
+                raise ValueError(
+                    "MINERU_WRAPPER_ENDPOINT is required when "
+                    "MINERU_API_MODE=wrapper"
+                )
+            _validate_base_url(
+                "MINERU_WRAPPER_ENDPOINT",
+                self.wrapper_endpoint,
+                ("/predict", "/health"),
+            )
+            self.endpoint = self.wrapper_endpoint
         self.poll_interval = float(os.getenv("MINERU_POLL_INTERVAL_SECONDS", "2"))
         # 600 * 2s client-side sleep ≈ 20 min worst case; raise for very large PDFs.
         self.max_polls = int(os.getenv("MINERU_MAX_POLLS", "600"))
+        self.http_timeout_seconds = _positive_float_env(
+            ("MINERU_HTTP_TIMEOUT_SECONDS", "REMOTE_PARSER_TIMEOUT"),
+            DEFAULT_MINERU_HTTP_TIMEOUT_SECONDS,
+        )
+        self.connect_timeout_seconds = _positive_float_env(
+            ("MINERU_CONNECT_TIMEOUT_SECONDS",),
+            DEFAULT_MINERU_CONNECT_TIMEOUT_SECONDS,
+        )
         self.engine_version = os.getenv("MINERU_ENGINE_VERSION", "").strip()
 
         options = MinerUParserOptions.from_env(
@@ -204,11 +266,18 @@ class MinerURawClient:
         raw_dir.mkdir(parents=True, exist_ok=True)
         resolved_upload_name = _resolve_upload_name(upload_name, source_file_path)
 
-        timeout = httpx.Timeout(120.0, connect=30.0)
+        timeout = httpx.Timeout(
+            self.http_timeout_seconds,
+            connect=self.connect_timeout_seconds,
+        )
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 if self.api_mode == "official":
                     task_id = await self._download_official(
+                        client, source_file_path, raw_dir, resolved_upload_name
+                    )
+                elif self.api_mode == "wrapper":
+                    task_id = await self._download_wrapper(
                         client, source_file_path, raw_dir, resolved_upload_name
                     )
                 else:
@@ -438,6 +507,270 @@ class MinerURawClient:
 
         raise TimeoutError(f"MinerU local task polling timeout: {task_id}")
 
+    # ------------------------------------------------------------------
+    # Wrapper mode: single synchronous POST {endpoint}/predict
+    # ------------------------------------------------------------------
+
+    def _wrapper_payload(self, file_b64: str, upload_name: str) -> dict[str, Any]:
+        return {
+            "file": file_b64,
+            "options": {
+                "orig_suffix": Path(upload_name).suffix or ".pdf",
+                "method": self.local_parse_method,
+                "backend": self.local_backend,
+                "lang": self.language,
+                "formula_enable": self.enable_formula,
+                "table_enable": self.enable_table,
+            },
+        }
+
+    async def _download_wrapper(
+        self,
+        client: "httpx.AsyncClient",
+        source_file_path: Path,
+        raw_dir: Path,
+        upload_name: str,
+    ) -> str:
+        submit_url = f"{self.wrapper_endpoint}/predict"
+        file_bytes = await asyncio.to_thread(source_file_path.read_bytes)
+        payload = self._wrapper_payload(
+            base64.b64encode(file_bytes).decode("ascii"), upload_name
+        )
+        resp = await client.post(submit_url, json=payload)
+        raise_for_status_with_detail(
+            resp,
+            f"MinerU wrapper predict for {upload_name!r}",
+        )
+        data = resp.json() if resp.text else {}
+        if not isinstance(data, dict) or not data:
+            raise RuntimeError(
+                f"MinerU wrapper predict returned an empty or non-object "
+                f"response for {upload_name!r}"
+            )
+
+        # Delivery priority: package_url zip > inline content_list > markdown.
+        package_url = str(data.get("package_url") or "").strip()
+        if package_url:
+            await self._download_zip(client, package_url, raw_dir)
+            self._ensure_wrapper_package_text_artifact(
+                raw_dir, source_file_path, upload_name
+            )
+            return ""
+
+        content_list = data.get("content_list")
+        if isinstance(content_list, list) and content_list:
+            logger.warning(
+                "[mineru_raw] wrapper delivered content_list without "
+                "package_url for %r: this delivery carries no image bytes, "
+                "so image artifacts will be missing from the raw bundle",
+                upload_name,
+            )
+            target = raw_dir / CONTENT_LIST_FILENAME
+            await asyncio.to_thread(
+                target.write_text,
+                json.dumps(content_list, ensure_ascii=False, indent=2),
+                "utf-8",
+            )
+            return ""
+
+        markdown, md_url = await self._fetch_wrapper_markdown(
+            client, data, upload_name
+        )
+        if markdown.strip():
+            await self._land_wrapper_markdown(
+                client, raw_dir, upload_name, markdown, md_url
+            )
+            return ""
+
+        raise RuntimeError(
+            f"MinerU wrapper predict response for {upload_name!r} has no "
+            f"usable delivery (expected package_url, content_list, or "
+            f"md/md_url); got keys: {sorted(data.keys())}"
+        )
+
+    async def _fetch_wrapper_markdown(
+        self,
+        client: "httpx.AsyncClient",
+        data: Mapping[str, Any],
+        upload_name: str,
+    ) -> tuple[str, str]:
+        """Return ``(markdown_text, md_url)`` from an inline field or md_url."""
+        inline = data.get("md") or data.get("markdown") or data.get("md_content")
+        if isinstance(inline, str) and inline.strip():
+            return inline, ""
+        md_url = str(data.get("md_url") or "").strip()
+        if not md_url:
+            return "", ""
+        resp = await client.get(md_url)
+        raise_for_status_with_detail(
+            resp,
+            f"MinerU wrapper markdown download for {upload_name!r}",
+        )
+        return resp.text, md_url
+
+    async def _land_wrapper_markdown(
+        self,
+        client: "httpx.AsyncClient",
+        raw_dir: Path,
+        upload_name: str,
+        markdown: str,
+        md_url: str,
+    ) -> None:
+        """Land a markdown delivery onto the canonical raw_dir layout.
+
+        Writes ``<stem>.md`` at raw_dir root, downloads relative image
+        references next to ``md_url`` (path-traversal guarded), and
+        synthesizes a root ``content_list.json`` so the manifest / IR
+        builder contract holds for a text-only delivery.
+        """
+        stem = Path(upload_name).stem or "document"
+        md_path = raw_dir / f"{stem}.md"
+        await asyncio.to_thread(md_path.write_text, markdown, "utf-8")
+
+        downloaded: list[str] = []
+        if md_url:
+            downloaded = await self._download_wrapper_md_assets(
+                client, markdown, md_url, raw_dir
+            )
+        elif _markdown_image_refs(markdown):
+            logger.warning(
+                "[mineru_raw] wrapper markdown for %r has relative image "
+                "references but no md_url to resolve them against; image "
+                "artifacts will be missing from the raw bundle",
+                upload_name,
+            )
+
+        content_list: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": markdown,
+                "content": markdown,
+                "page_idx": 0,
+            }
+        ]
+        for rel in downloaded:
+            content_list.append({"type": "image", "img_path": rel, "page_idx": 0})
+        target = raw_dir / CONTENT_LIST_FILENAME
+        await asyncio.to_thread(
+            target.write_text,
+            json.dumps(content_list, ensure_ascii=False, indent=2),
+            "utf-8",
+        )
+
+    async def _download_wrapper_md_assets(
+        self,
+        client: "httpx.AsyncClient",
+        markdown: str,
+        md_url: str,
+        raw_dir: Path,
+    ) -> list[str]:
+        """Download relative markdown image refs next to ``md_url``.
+
+        Mirrors the legacy wrapper client's remote-asset handling: refs with
+        a scheme or a server-absolute path are left untouched, a ref that
+        would land outside ``raw_dir`` is skipped (path traversal guard),
+        and per-asset failures degrade to a warning so the text artifact
+        still lands. Returns the raw_dir-relative posix paths that were
+        written.
+        """
+        downloaded: list[str] = []
+        raw_root = raw_dir.resolve()
+        for ref in _markdown_image_refs(markdown):
+            dest = (raw_dir / ref).resolve()
+            try:
+                rel = dest.relative_to(raw_root)
+            except ValueError:
+                logger.warning(
+                    "[mineru_raw] wrapper markdown asset ref %r escapes "
+                    "raw_dir; skipped",
+                    ref,
+                )
+                continue
+            asset_url = urljoin(md_url, ref)
+            try:
+                resp = await client.get(asset_url)
+                raise_for_status_with_detail(
+                    resp, f"MinerU wrapper asset download {ref!r}"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[mineru_raw] wrapper markdown asset download failed "
+                    "ref=%s url=%s err=%s",
+                    ref,
+                    asset_url,
+                    exc,
+                )
+                continue
+
+            def _write(content: bytes = resp.content, path: Path = dest) -> None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+
+            await asyncio.to_thread(_write)
+            downloaded.append(rel.as_posix())
+        return downloaded
+
+    def _ensure_wrapper_package_text_artifact(
+        self,
+        raw_dir: Path,
+        source_file_path: Path,
+        upload_name: str,
+    ) -> None:
+        """A package_url-only response must still yield a text artifact.
+
+        Bundles normally carry both ``*_content_list.json`` and ``*.md`` —
+        the post-download normalization pass hoists the content list to
+        raw_dir root, so a nested candidate is fine. When the bundle has no
+        content list at all, fall back to its markdown and synthesize a root
+        ``content_list.json``; raise only when the package has neither.
+        """
+        if (raw_dir / CONTENT_LIST_FILENAME).is_file():
+            return
+        if (
+            _select_content_list_candidate(raw_dir, source_file_path, upload_name)
+            is not None
+        ):
+            return
+        md_path = _find_bundle_markdown(raw_dir)
+        if md_path is None:
+            raise RuntimeError(
+                f"MinerU wrapper package for {upload_name!r} contains neither "
+                f"a content_list JSON nor a markdown artifact "
+                f"(raw_dir={raw_dir})"
+            )
+        logger.warning(
+            "[mineru_raw] wrapper package for %r has no content_list JSON; "
+            "synthesizing one from bundle markdown %s",
+            upload_name,
+            md_path.name,
+        )
+        markdown = md_path.read_text(encoding="utf-8")
+        raw_root = raw_dir.resolve()
+        content_list: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": markdown,
+                "content": markdown,
+                "page_idx": 0,
+            }
+        ]
+        # Refs in the bundle markdown are relative to the md file's own
+        # directory; record existing image files with raw_dir-relative paths.
+        for ref in _markdown_image_refs(markdown):
+            candidate = (md_path.parent / ref).resolve()
+            try:
+                rel = candidate.relative_to(raw_root)
+            except ValueError:
+                continue
+            if candidate.is_file():
+                content_list.append(
+                    {"type": "image", "img_path": rel.as_posix(), "page_idx": 0}
+                )
+        (raw_dir / CONTENT_LIST_FILENAME).write_text(
+            json.dumps(content_list, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     async def _download_zip(
         self,
         client: "httpx.AsyncClient",
@@ -632,6 +965,37 @@ def _find_content_list(payload: Any, content_field: str) -> list[dict] | None:
 
 def _bool_form(value: bool) -> str:
     return "true" if value else "false"
+
+
+def _markdown_image_refs(markdown: str) -> list[str]:
+    """Extract deduplicated relative image refs from markdown, in order.
+
+    Absolute URLs (any scheme) and server-absolute paths are skipped — they
+    are neither downloaded nor rewritten, matching the remote-asset handling
+    of the legacy wrapper client.
+    """
+    refs: list[str] = []
+    seen: set[str] = set()
+    for pattern in _MD_IMAGE_REF_RES:
+        for match in pattern.findall(markdown or ""):
+            ref = str(match).strip()
+            if not ref or ref.startswith("/") or _ABSOLUTE_REF_RE.match(ref):
+                continue
+            clean = ref.split("?", 1)[0].split("#", 1)[0]
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            refs.append(clean)
+    return refs
+
+
+def _find_bundle_markdown(raw_dir: Path) -> Path | None:
+    """Pick the most likely primary markdown artifact inside a bundle."""
+    candidates = [p for p in raw_dir.rglob("*.md") if p.is_file()]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: (len(p.relative_to(raw_dir).parts), p.as_posix()))
+    return candidates[0]
 
 
 def _select_official_extract_result(

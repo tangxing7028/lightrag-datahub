@@ -4080,7 +4080,12 @@ class MongoVectorDBStorage(BaseVectorStorage):
                 self._pending_vector_docs[doc_id] = pdoc
 
     async def query(
-        self, query: str, top_k: int, query_embedding: list[float] = None
+        self,
+        query: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+        doc_ids: list[str] | None = None,
+        cosine_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
         """Queries the vector database using Atlas Vector Search.
 
@@ -4091,6 +4096,12 @@ class MongoVectorDBStorage(BaseVectorStorage):
         or flush first. Matches the deferred-embedding contract used by
         OpenSearch / FAISS / Nano.
         """
+        if doc_ids is not None:
+            logger.warning(
+                "MongoVectorDBStorage does not implement doc_ids filtering; "
+                "the parameter is accepted for interface compatibility and "
+                "ignored. Only PGVectorStorage enforces document allow-lists."
+            )
         if query_embedding is not None:
             # Convert numpy array to list if needed for MongoDB compatibility
             if hasattr(query_embedding, "tolist"):

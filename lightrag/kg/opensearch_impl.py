@@ -5864,9 +5864,20 @@ class OpenSearchVectorDBStorage(BaseVectorStorage):
                 )
 
     async def query(
-        self, query: str, top_k: int, query_embedding: list[float] = None
+        self,
+        query: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+        doc_ids: list[str] | None = None,
+        cosine_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
         """k-NN similarity search with cosine score conversion for lucene engine."""
+        if doc_ids is not None:
+            logger.warning(
+                "OpenSearchVectorDBStorage does not implement doc_ids filtering; "
+                "the parameter is accepted for interface compatibility and "
+                "ignored. Only PGVectorStorage enforces document allow-lists."
+            )
         if not self._index_ready:
             return []
         if query_embedding is not None:

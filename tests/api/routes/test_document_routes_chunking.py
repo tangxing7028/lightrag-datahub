@@ -888,3 +888,19 @@ def test_insert_text_allows_small_size_for_delimiter_only(monkeypatch):
     )
     assert resp.status_code == 200
     assert captured["chunking"].params["chunk_token_size"] == 50
+
+
+def test_parse_upload_chunking_accepts_json_string():
+    """The upload multipart contract ships chunking as a JSON string."""
+    cfg = _dr._parse_upload_chunking(
+        '{"strategy": "fixed_token", "params": {"chunk_token_size": 512}}'
+    )
+    assert cfg is not None
+    assert cfg.strategy == "fixed_token"
+
+
+def test_parse_upload_chunking_rejects_invalid_json():
+    import pytest as _pytest
+
+    with _pytest.raises(Exception):
+        _dr._parse_upload_chunking("not-json")

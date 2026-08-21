@@ -381,7 +381,12 @@ class FaissVectorDBStorage(BaseVectorStorage):
                 self._pending_upserts[doc_id] = _PendingFaissDoc(record=record)
 
     async def query(
-        self, query: str, top_k: int, query_embedding: list[float] = None
+        self,
+        query: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+        doc_ids: list[str] | None = None,
+        cosine_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
         """Similarity search over data already materialized into ``self._index``.
 
@@ -393,6 +398,12 @@ class FaissVectorDBStorage(BaseVectorStorage):
 
         Returns top_k results with their metadata + similarity distance.
         """
+        if doc_ids is not None:
+            logger.warning(
+                "FaissVectorDBStorage does not implement doc_ids filtering; "
+                "the parameter is accepted for interface compatibility and "
+                "ignored. Only PGVectorStorage enforces document allow-lists."
+            )
         if query_embedding is not None:
             embedding = np.array([query_embedding], dtype=np.float32)
         else:

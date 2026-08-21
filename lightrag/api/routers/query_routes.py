@@ -7,9 +7,11 @@ import json
 import time
 from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends
+from lightrag import LightRAG
 from lightrag.base import QueryParam
 from lightrag.api.input_limits import count_conversation_input_chars
 from lightrag.api.utils_api import get_combined_auth_dependency, internal_server_error
+from lightrag.api.workspace_manager import make_rag_dependency
 from lightrag.constants import (
     MAX_KEYWORD_CHARS,
     MAX_KEYWORDS_PER_LIST,
@@ -116,6 +118,31 @@ class QueryRequest(BaseModel):
     enable_rerank: Optional[bool] = Field(
         default=None,
         description="Enable reranking for retrieved text chunks. If True but no rerank model is configured, a warning will be issued. Default is True.",
+    )
+
+    doc_ids: Optional[List[str]] = Field(
+        default=None,
+        description="Optional allow-list of document IDs restricting retrieval scope. "
+        "Omit (null) for no filtering. An empty list means zero authorized documents "
+        "and returns no retrieval results (fail-closed). "
+        "Enforced by the PostgreSQL and Milvus vector storage backends.",
+    )
+
+    enable_summary_search: Optional[bool] = Field(
+        default=None,
+        description="Enable two-stage summary-first retrieval: search per-document "
+        "LLM summaries first, then restrict the chunk search to the matched "
+        "documents. Falls back to regular retrieval when no summary matches. "
+        "Defaults to False.",
+    )
+
+    cosine_threshold: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Optional per-query cosine similarity threshold override for vector retrieval. "
+        "Omit (null) to use the storage-level default. "
+        "Currently only enforced by the PostgreSQL vector storage backend.",
     )
 
     include_references: Optional[bool] = Field(
@@ -315,6 +342,11 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
     combined_auth = get_combined_auth_dependency(api_key)
 
+    # Per-request instance resolution: the LIGHTRAG-WORKSPACE header selects
+    # the LightRAG instance via app.state.rag_manager; without a manager the
+    # factory-provided default instance is used (see workspace_manager.py).
+    resolve_request_rag = make_rag_dependency(rag)
+
     @router.post(
         "/query",
         response_model=QueryResponse,
@@ -444,7 +476,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(
+        request: QueryRequest,
+        rag: LightRAG = resolve_request_rag,
+    ):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
@@ -733,7 +768,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text_stream(request: QueryRequest):
+    async def query_text_stream(
+        request: QueryRequest,
+        rag: LightRAG = resolve_request_rag,
+    ):
         """
         Advanced RAG query endpoint with flexible streaming response.
 
@@ -1306,7 +1344,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_data(request: QueryRequest):
+    async def query_data(
+        request: QueryRequest,
+        rag: LightRAG = resolve_request_rag,
+    ):
         """
         Advanced data retrieval endpoint for structured RAG analysis.
 
