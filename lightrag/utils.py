@@ -4548,6 +4548,12 @@ def empty_length_truncated_hint(
 # doc_status.metadata key holding the per-document truncation summary.
 LLM_TRUNCATION_METADATA_KEY = "llm_truncation"
 
+# doc_status.metadata key used when an extraction response is exhausted after
+# retries because the model emitted no usable content. This is deliberately
+# distinct from token-limit truncation: the body/chunk vectors remain valid,
+# but the affected chunk has no graph contribution.
+ENTITY_EXTRACTION_DEGRADATION_METADATA_KEY = "entity_extraction_degradation"
+
 # Cap on the number of affected subjects (chunk ids / entity names) echoed into
 # that metadata entry. The doc_status row is serialized into every documents
 # listing response, so the summary must stay O(1) in document size; the exact
@@ -4645,6 +4651,71 @@ class TokenLimitTruncationTally:
         """
         payload = self.as_metadata()
         return {LLM_TRUNCATION_METADATA_KEY: payload} if payload else {}
+
+
+class EntityExtractionDegradationTally:
+    """Accumulate recoverable empty-model-output extraction failures.
+
+    A retry-exhausted, explicitly empty model response is narrower than a
+    generic LLM failure: it has no entity or relation payload to merge, but the
+    parsed body and chunk vectors are still sound. The tally gives the document
+    status a bounded, durable explanation for that best-effort result.
+    """
+
+    __slots__ = ("_events", "_stages", "_subjects")
+
+    def __init__(self) -> None:
+        self._events = 0
+        self._stages: dict[str, int] = {}
+        self._subjects: dict[str, None] = {}
+
+    def __bool__(self) -> bool:
+        return self._events > 0
+
+    @property
+    def events(self) -> int:
+        return self._events
+
+    @property
+    def affected(self) -> int:
+        return len(self._subjects)
+
+    def record(self, stage: str, subject: str) -> bool:
+        """Record one degraded extraction; return True for the first event."""
+        first = self._events == 0
+        self._events += 1
+        self._stages[stage] = self._stages.get(stage, 0) + 1
+        if subject:
+            self._subjects.setdefault(subject, None)
+        return first
+
+    def absorb(self, other: "EntityExtractionDegradationTally | None") -> None:
+        if not other:
+            return
+        self._events += other._events
+        for stage, count in other._stages.items():
+            self._stages[stage] = self._stages.get(stage, 0) + count
+        for subject in other._subjects:
+            self._subjects.setdefault(subject, None)
+
+    def stage_breakdown(self) -> str:
+        return ", ".join(f"{stage}: {count}" for stage, count in self._stages.items())
+
+    def as_metadata(self) -> dict[str, Any] | None:
+        if not self._events:
+            return None
+        subjects = list(self._subjects)
+        payload: dict[str, Any] = {
+            "reason": "empty_model_output_after_retries",
+            "events": self._events,
+            "affected": len(subjects),
+            "stages": dict(self._stages),
+            "samples": subjects[:TRUNCATION_METADATA_SAMPLE_LIMIT],
+        }
+        omitted = len(subjects) - TRUNCATION_METADATA_SAMPLE_LIMIT
+        if omitted > 0:
+            payload["samples_omitted"] = omitted
+        return payload
 
 
 def merge_truncation_metadata(

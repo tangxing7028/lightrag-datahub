@@ -2647,6 +2647,14 @@ def create_app(args):
 
             # Cleanup expired keyed locks and get status
             keyed_lock_info = cleanup_keyed_lock()
+            try:
+                from lightrag.parser.external.mineru.scheduling import (
+                    mineru_scheduling_status,
+                )
+
+                mineru_scheduling = await mineru_scheduling_status()
+            except Exception:  # diagnostics must never turn /health into a 500
+                mineru_scheduling = {"snapshot_available": False}
 
             status_data.update(
                 {
@@ -2723,6 +2731,7 @@ def create_app(args):
                     # rework introduced (LR2 Phase 6 item 3); see
                     # lightrag/pipeline_metrics.py for the boundary.
                     "scheduling_metrics": pipeline_metrics.snapshot(),
+                    "mineru_scheduling": mineru_scheduling,
                     "keyed_locks": keyed_lock_info,
                     "llm_queue_status": await rag.get_llm_queue_status(
                         include_base=True
