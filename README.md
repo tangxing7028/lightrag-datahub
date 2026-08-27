@@ -336,7 +336,8 @@ For large-scale document processing, you need to improve concurrency. Key enviro
 
 - **MAX_ASYNC_LLM/EXTRACT_ASYNC_LLM**: Controls the maximum concurrency for LLM models.
 - **MAX_PARALLEL_INSERT**: Controls the maximum number of files processed in parallel. Processing of text, tables, formulas, and images within a single file will also occur concurrently. `MAX_PARALLEL_INSERT` should ideally be set to about 1/3 of `MAX_ASYNC_LLM`.
-- **MAX_PARALLEL_PARSE_MINERU**: Controls the number of parallel files processed for MinerU parsing.
+- **MAX_PARALLEL_PARSE_MINERU**: Caps actual remote MinerU requests per runtime process.
+- **MAX_PENDING_MINERU_ADMISSIONS**: Bounds MinerU parser tasks waiting to enter the shared weighted scheduler; it does not raise remote request concurrency.
 - **MAX_PARALLEL_PARSE_DOCLING**: Controls the number of parallel files processed for Docling parsing.
 - **EMBEDDING_FUNC_MAX_ASYNC**: Controls the maximum concurrency for embedding models.
 - **EMBEDDING_BATCH_NUM**: Controls the number of texts included in each embedding model request (how many embeddings per batch). Increasing this number can significantly reduce the number of API calls to the embedding model and speed up data persistence in the embedding storage.

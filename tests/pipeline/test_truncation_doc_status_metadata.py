@@ -24,15 +24,19 @@ pin — are the ones that come from the metadata whitelists in
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import numpy as np
 import pytest
+from tenacity import RetryError
 
 from lightrag import LightRAG
 from lightrag.base import DocStatus
+from lightrag.llm.openai import InvalidResponseError
 from lightrag.utils import (
     EmbeddingFunc,
+    ENTITY_EXTRACTION_DEGRADATION_METADATA_KEY,
     LLM_TRUNCATION_METADATA_KEY,
     Tokenizer,
     TokenizerInterface,
@@ -116,6 +120,39 @@ async def test_a_clean_run_leaves_no_truncation_record(tmp_path):
 
     assert status["status"] == DocStatus.PROCESSED
     assert LLM_TRUNCATION_METADATA_KEY not in status["metadata"]
+
+
+async def test_empty_model_output_after_retries_is_durable_degradation(tmp_path):
+    """The document remains searchable by chunk text and exposes why its KG is partial."""
+
+    async def _empty_llm(prompt, **kwargs):
+        attempt = asyncio.Future()
+        attempt.set_exception(
+            InvalidResponseError(
+                "Received empty content from OpenAI API "
+                "(finish_reason=stop, completion_tokens=0, reasoning_tokens=n/a, "
+                "reasoning_content_len=0): model produced no output"
+            )
+        )
+        raise RetryError(attempt)
+
+    rag = _new_rag(tmp_path, _empty_llm)
+    await rag.initialize_storages()
+    try:
+        status = await _ingest(rag, doc_id="doc-empty-model", body="A valid body.")
+        chunk_id = status["chunks_list"][0]
+        stored_chunk = await rag.text_chunks.get_by_id(chunk_id)
+    finally:
+        await rag.finalize_storages()
+
+    assert status["status"] == DocStatus.PROCESSED
+    assert stored_chunk is not None
+    summary = status["metadata"][ENTITY_EXTRACTION_DEGRADATION_METADATA_KEY]
+    assert summary["reason"] == "empty_model_output_after_retries"
+    assert summary["events"] == 1
+    assert summary["affected"] == 1
+    assert summary["stages"] == {"initial": 1}
+    assert summary["samples"] == [chunk_id]
 
 
 def test_the_summary_is_not_carried_over_to_the_next_attempt():

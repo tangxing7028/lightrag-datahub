@@ -52,6 +52,25 @@ def test_vlm_process_enable_true_with_openai_passes(monkeypatch):
     assert args.vlm_process_enable is True
 
 
+def test_vlm_internal_openai_gateway_uses_service_token(monkeypatch):
+    _reset_vlm_env(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["lightrag-server"])
+    monkeypatch.setenv("LLM_BINDING", "openai")
+    monkeypatch.setenv("AI_SERVICE_URL", "http://ai-service:8085")
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "service-token")
+    monkeypatch.setenv("VLM_PROCESS_ENABLE", "true")
+    monkeypatch.setenv("VLM_LLM_BINDING", "openai")
+    monkeypatch.setenv("VLM_LLM_MODEL", "vlm-test")
+    monkeypatch.setenv(
+        "VLM_LLM_BINDING_HOST", "http://ai-service:8085/ai/internal/openai/v1"
+    )
+    monkeypatch.setenv("VLM_LLM_BINDING_API_KEY", "provider-token")
+
+    args = parse_args()
+
+    assert args.vlm_llm_binding_api_key == "service-token"
+
+
 def test_vlm_process_enable_rejects_lollms_base_binding(monkeypatch):
     _reset_vlm_env(monkeypatch)
     monkeypatch.setattr(sys, "argv", ["lightrag-server"])

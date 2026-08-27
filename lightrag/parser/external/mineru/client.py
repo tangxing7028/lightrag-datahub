@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import math
 import os
@@ -111,6 +112,60 @@ def _positive_float_env(names: tuple[str, ...], default: float) -> float:
     return default
 
 
+def _positive_float_option(
+    configured: Any,
+    env_names: tuple[str, ...],
+    default: float,
+) -> float:
+    """Prefer a validated dynamic runtime value, then preserve env fallback."""
+    if configured is not None:
+        try:
+            value = float(configured)
+        except (TypeError, ValueError):
+            value = 0.0
+        if math.isfinite(value) and value > 0:
+            return value
+        logger.warning("MinerU dynamic timeout must be positive; using env fallback")
+    return _positive_float_env(env_names, default)
+
+
+def _positive_int_option(
+    configured: Any,
+    env_names: tuple[str, ...],
+    default: int,
+) -> int:
+    """Prefer a validated dynamic poll count, then preserve env fallback."""
+    if configured is not None and not isinstance(configured, bool):
+        try:
+            value = int(configured)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+        logger.warning("MinerU dynamic poll count must be positive; using env fallback")
+    for name in env_names:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("%s must be a positive integer; using the next fallback", name)
+            continue
+        if value > 0:
+            return value
+        logger.warning("%s must be a positive integer; using the next fallback", name)
+    return default
+
+
+def _timeout_exception_types() -> tuple[type[BaseException], ...]:
+    """Return the timeout classes available in real or test httpx modules."""
+    timeout_exception = getattr(httpx, "TimeoutException", None)
+    if isinstance(timeout_exception, type) and issubclass(timeout_exception, BaseException):
+        return (timeout_exception, TimeoutError)
+    return (TimeoutError,)
+
+
 def _resolve_upload_name(upload_name: str | None, source_file_path: Path) -> str:
     candidate = Path(str(upload_name or "")).name
     return candidate or source_file_path.name
@@ -154,8 +209,16 @@ class MinerURawClient:
     cannot expose without leaking abstractions.
     """
 
-    def __init__(self, *, overrides: "Mapping[str, Any] | None" = None) -> None:
+    def __init__(
+        self,
+        *,
+        overrides: "Mapping[str, Any] | None" = None,
+        runtime_options: "Mapping[str, Any] | None" = None,
+    ) -> None:
         self._overrides = overrides or {}
+        self._runtime_options = runtime_options or {}
+        self._remote_task_id = ""
+        self._on_remote_task = self._runtime_options.get("on_remote_task")
         self.api_mode = (
             os.getenv("MINERU_API_MODE", DEFAULT_MINERU_API_MODE).strip().lower()
         )
@@ -177,6 +240,14 @@ class MinerURawClient:
         self.wrapper_endpoint = _strip_trailing_slash(
             os.getenv("MINERU_WRAPPER_ENDPOINT", "").strip()
         )
+        configured_base_url = str(
+            self._runtime_options.get("mineru_base_url") or ""
+        ).strip()
+        if configured_base_url:
+            if self.api_mode == "local":
+                self.local_endpoint = _strip_trailing_slash(configured_base_url)
+            elif self.api_mode == "wrapper":
+                self.wrapper_endpoint = _strip_trailing_slash(configured_base_url)
         self.api_token = os.getenv("MINERU_API_TOKEN", "").strip()
         if self.api_mode == "official":
             if not self.api_token:
@@ -212,14 +283,24 @@ class MinerURawClient:
                 ("/predict", "/health"),
             )
             self.endpoint = self.wrapper_endpoint
-        self.poll_interval = float(os.getenv("MINERU_POLL_INTERVAL_SECONDS", "2"))
+        self.poll_interval = _positive_float_option(
+            self._runtime_options.get("poll_interval_seconds"),
+            ("MINERU_POLL_INTERVAL_SECONDS",),
+            2.0,
+        )
         # 600 * 2s client-side sleep ≈ 20 min worst case; raise for very large PDFs.
-        self.max_polls = int(os.getenv("MINERU_MAX_POLLS", "600"))
-        self.http_timeout_seconds = _positive_float_env(
+        self.max_polls = _positive_int_option(
+            self._runtime_options.get("poll_max_attempts"),
+            ("MINERU_MAX_POLLS",),
+            600,
+        )
+        self.http_timeout_seconds = _positive_float_option(
+            self._runtime_options.get("read_timeout_seconds"),
             ("MINERU_HTTP_TIMEOUT_SECONDS", "REMOTE_PARSER_TIMEOUT"),
             DEFAULT_MINERU_HTTP_TIMEOUT_SECONDS,
         )
-        self.connect_timeout_seconds = _positive_float_env(
+        self.connect_timeout_seconds = _positive_float_option(
+            self._runtime_options.get("connect_timeout_seconds"),
             ("MINERU_CONNECT_TIMEOUT_SECONDS",),
             DEFAULT_MINERU_CONNECT_TIMEOUT_SECONDS,
         )
@@ -284,6 +365,21 @@ class MinerURawClient:
                     task_id = await self._download_local(
                         client, source_file_path, raw_dir, resolved_upload_name
                     )
+        except _timeout_exception_types() as exc:
+            from lightrag.parser.external.mineru.scheduling import MinerURequestTimeout
+
+            timeout_kind = "poll" if self._remote_task_id else "read"
+            remote_task_terminal, remote_task_state = (
+                await self._confirm_remote_task_terminal(resolved_upload_name)
+            )
+            raise MinerURequestTimeout(
+                f"MinerU {self.api_mode} backend {timeout_kind} timeout "
+                f"(endpoint={self.endpoint}, task_id={self._remote_task_id or 'unknown'}): {exc}",
+                remote_task_id=self._remote_task_id,
+                timeout_kind=timeout_kind,
+                remote_task_terminal=remote_task_terminal,
+                remote_task_state=remote_task_state,
+            ) from exc
         except httpx.RequestError as exc:
             # Transport-level failures (connection refused/reset, server
             # disconnect, read/connect timeout) bubble up from httpx with an
@@ -303,6 +399,74 @@ class MinerURawClient:
         return self._build_and_write_manifest(
             raw_dir, source_file_path, task_id, resolved_upload_name
         )
+
+    async def _record_remote_task(self, task_id: str) -> None:
+        """Record a server-issued task id before polling can time out."""
+        self._remote_task_id = str(task_id or "")
+        callback = self._on_remote_task
+        if callback is None or not self._remote_task_id:
+            return
+        try:
+            result = callback(self._remote_task_id)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as error:  # observability must not fail a parse
+            logger.warning("MinerU task-id callback failed: %s", error)
+
+    async def _confirm_remote_task_terminal(
+        self, upload_name: str
+    ) -> tuple[bool, str]:
+        """Best-effort terminal-state probe after a request or poll timeout.
+
+        A local or official MinerU job can keep running after the client times
+        out. The caller uses the result to decide between immediate release and
+        a conservative recovery lease. Wrapper mode has no portable task-status
+        contract, so it always reports an unknown state.
+        """
+        task_id = self._remote_task_id
+        if not task_id or self.api_mode == "wrapper" or httpx is None:
+            return False, "unknown"
+        probe_timeout = httpx.Timeout(
+            min(10.0, self.http_timeout_seconds),
+            connect=min(5.0, self.connect_timeout_seconds),
+        )
+        try:
+            async with httpx.AsyncClient(timeout=probe_timeout) as client:
+                if self.api_mode == "official":
+                    encoded_task_id = quote(task_id, safe="")
+                    response = await client.get(
+                        f"{self.official_endpoint}/api/v4/extract-results/batch/{encoded_task_id}",
+                        headers=self._official_headers(),
+                    )
+                    raise_for_status_with_detail(
+                        response, "MinerU official timeout status probe"
+                    )
+                    payload = response.json() if response.text else {}
+                    self._raise_if_official_error(
+                        payload, "MinerU official timeout status probe"
+                    )
+                    results = _get_by_path(payload, "data.extract_result")
+                    if isinstance(results, dict):
+                        results = [results]
+                    if not isinstance(results, list):
+                        return False, "unknown"
+                    selected = _select_official_extract_result(results, upload_name)
+                    state = str((selected or {}).get("state") or "").lower()
+                    return state in OFFICIAL_DONE_STATES | OFFICIAL_FAILED_STATES, state or "unknown"
+
+                encoded_task_id = quote(task_id, safe="")
+                response = await client.get(
+                    f"{self.local_endpoint}/tasks/{encoded_task_id}"
+                )
+                raise_for_status_with_detail(response, "MinerU local timeout status probe")
+                payload = response.json() if response.text else {}
+                state = str(payload.get("status") or "").lower()
+                return state in LOCAL_DONE_STATES | LOCAL_FAILED_STATES, state or "unknown"
+        except Exception as error:
+            logger.warning(
+                "MinerU timeout status probe failed for task %s: %s", task_id, error
+            )
+            return False, "unknown"
 
     # ------------------------------------------------------------------
     # Upload + poll
@@ -352,6 +516,7 @@ class MinerURawClient:
                 f"MinerU official upload URL response missing batch_id/file_urls: "
                 f"{payload}"
             )
+        await self._record_remote_task(batch_id)
 
         first_file_url = file_urls[0]
         if isinstance(first_file_url, dict):
@@ -473,6 +638,7 @@ class MinerURawClient:
             raise RuntimeError(
                 f"MinerU local /tasks response missing task_id: {payload}"
             )
+        await self._record_remote_task(task_id)
 
         await self._poll_local_task(client, task_id)
         await self._download_zip(

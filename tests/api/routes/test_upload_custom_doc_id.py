@@ -1,15 +1,16 @@
 """``POST /documents/upload`` with a caller-assigned ``doc_id`` form field.
 
 The endpoint forwards a validated id to the pending_parse enqueue as the
-``ids`` override, rejects malformed ids with 400 before any byte is written,
-returns 409 when the id already exists in a non-FAILED state (same semantics
-as the same-name 409), and retires a FAILED record via the sanctioned
-deletion path so a re-upload under the same id is a clean retry.
+``ids`` override, assigns that id a runtime-private physical filename, rejects
+malformed ids with 400 before any byte is written, returns 409 when the id
+already exists in a non-FAILED state, and retires a FAILED record via the
+sanctioned deletion path so a re-upload under the same id is a clean retry.
 """
 
 import importlib
 import sys
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -148,14 +149,69 @@ async def test_upload_with_custom_doc_id_forwards_ids_override(tmp_path, monkeyp
     await _await_managed(managed)
 
     assert response.status == "success"
-    assert (doc_manager.input_dir / "report.md").exists()
+    storage_name = "__datahub_doc_8012345678901234567890__report.md"
+    assert (doc_manager.input_dir / storage_name).exists()
+    assert not (doc_manager.input_dir / "report.md").exists()
     assert len(rag.enqueued) == 1
     enqueued = rag.enqueued[0]
     assert enqueued["ids"] == ["8012345678901234567890"]
     assert enqueued["docs_format"] == "pending_parse"
-    assert enqueued["file_paths"].endswith("report.md")
+    assert enqueued["file_paths"].endswith(storage_name)
     assert rag.process_calls == 1
     assert rag.deleted == []
+
+
+async def test_upload_same_display_name_with_distinct_doc_ids_is_independent(
+    tmp_path, monkeypatch
+):
+    """DataHub may archive same-name source files; the runtime must not 409.
+
+    The physical name remains unique per document while the terminal native
+    parser hint stays usable after the prefix is added.
+    """
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    rag = _UploadRag()
+    doc_manager = DocumentManager(str(tmp_path), workspace=rag.workspace)
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    endpoint = _upload_endpoint(rag, doc_manager)
+
+    first_id = "8012345678901234567891"
+    second_id = "8012345678901234567892"
+    first_tasks = set()
+    second_tasks = set()
+    first = await endpoint(
+        first_tasks,
+        _document_routes.UploadFile(
+            filename="same.[native].md", file=BytesIO(b"first body")
+        ),
+        doc_id=first_id,
+    )
+    second = await endpoint(
+        second_tasks,
+        _document_routes.UploadFile(
+            filename="same.[native].md", file=BytesIO(b"second body")
+        ),
+        doc_id=second_id,
+    )
+    await _await_managed(first_tasks)
+    await _await_managed(second_tasks)
+
+    assert first.status == "success"
+    assert second.status == "success"
+    first_name = f"__datahub_doc_{first_id}__same.[native].md"
+    second_name = f"__datahub_doc_{second_id}__same.[native].md"
+    assert (doc_manager.input_dir / first_name).exists()
+    assert (doc_manager.input_dir / second_name).exists()
+    assert len(rag.enqueued) == 2
+    assert [entry["ids"] for entry in rag.enqueued] == [[first_id], [second_id]]
+    assert [entry["parse_engine"] for entry in rag.enqueued] == ["native", "native"]
+    assert [Path(entry["file_paths"]).name for entry in rag.enqueued] == [
+        first_name,
+        second_name,
+    ]
 
 
 async def test_upload_without_doc_id_passes_no_ids(tmp_path, monkeypatch):

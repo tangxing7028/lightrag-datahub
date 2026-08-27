@@ -49,6 +49,7 @@ from lightrag.constants import (
     KG_WRITE_STATE_GRAPH_MUTATION_STARTED,
     KG_WRITE_STATE_METADATA_KEY,
     KG_WRITE_STATE_PRE_GRAPH,
+    PARSER_ENGINE_MINERU,
     PARSED_DIR_NAME,
 )
 from lightrag.exceptions import (
@@ -115,6 +116,8 @@ from lightrag.utils import (
     save_to_cache,
     serialize_llm_cache_identity,
     strip_control_characters,
+    ENTITY_EXTRACTION_DEGRADATION_METADATA_KEY,
+    EntityExtractionDegradationTally,
     LLM_TRUNCATION_METADATA_KEY,
     merge_truncation_metadata,
     TokenLimitTruncationTally,
@@ -175,6 +178,21 @@ _AUTO_RESUME_DOC_STATUSES = (
     DocStatus.PARSING,
     DocStatus.ANALYZING,
 )
+
+
+def _mineru_admission_worker_count(
+    static_request_cap: int, pending_admission_limit: int
+) -> int:
+    """Size MinerU parser workers for fair admission without raising requests.
+
+    Workers waiting for the shared weighted lease do not contact MinerU. Keep a
+    bounded pool larger than the actual request limit so later small documents
+    can join the common waiter set and fill capacity that an earlier large
+    document cannot use. The lease itself atomically enforces the static and
+    dynamic per-runtime request cap before any remote request starts.
+    """
+    return max(1, max(max(1, static_request_cap), max(1, pending_admission_limit)))
+
 
 # Multiprocess feeder poll interval: the Manager-backed ingress has no async
 # ``get_document``, so the feeder blocks a worker thread in
@@ -301,6 +319,8 @@ class PipelineNextDecision:
     # Set only for CONTINUE_MANUAL: the sticky request this continuation
     # serves; ACKed after the FAILED→PENDING reset persists.
     manual_request_id: str | None = None
+    # An empty tuple retains the historical workspace-wide FAILED reset.
+    manual_doc_ids: tuple[str, ...] = ()
     # Set only for CANCELLED: True when the cancellation is an internal-error
     # abort, whose exit path surfaces the actionable halt message.
     internal_error: bool = False
@@ -1000,7 +1020,9 @@ class _PipelineMixin:
             model_config = opts.get("model_config")
             return {
                 "enable_summary": True,
-                "model_config": model_config if isinstance(model_config, dict) else None,
+                "model_config": model_config
+                if isinstance(model_config, dict)
+                else None,
             }
 
         # 1. Validate ids and build contents (when lightrag: no content dedup, content may be empty)
@@ -1523,9 +1545,7 @@ class _PipelineMixin:
                         else None
                     )
                     if isinstance(raw_model_config, dict):
-                        summary_configs = getattr(
-                            self, "_summary_model_configs", None
-                        )
+                        summary_configs = getattr(self, "_summary_model_configs", None)
                         if isinstance(summary_configs, dict):
                             summary_configs[str(doc_id)] = deepcopy(raw_model_config)
                         persisted_model_config = self._scrubbed_llm_metadata(
@@ -1870,7 +1890,11 @@ class _PipelineMixin:
             manual_msg = ingress.peek_next_manual_retry()
             if manual_msg is not None:
                 await self._begin_manual_drain(
-                    manual_msg.request_id, token, pipeline_status, pipeline_status_lock
+                    manual_msg.request_id,
+                    token,
+                    pipeline_status,
+                    pipeline_status_lock,
+                    doc_ids=manual_msg.doc_ids,
                 )
                 absorbed_auto_rescan = False
             else:
@@ -2739,6 +2763,12 @@ class _PipelineMixin:
         group_worker_counts = {
             group: max(1, _group_concurrency(group)) for group in parse_queues
         }
+        if PARSER_ENGINE_MINERU in group_worker_counts:
+            static_request_cap = group_worker_counts[PARSER_ENGINE_MINERU]
+            group_worker_counts[PARSER_ENGINE_MINERU] = _mineru_admission_worker_count(
+                static_request_cap,
+                self.max_pending_mineru_admissions,
+            )
 
         cancellation_watcher = asyncio.create_task(_watch_pipeline_cancellation())
         workers: list[asyncio.Task] = []
@@ -3161,6 +3191,8 @@ class _PipelineMixin:
         token: str,
         pipeline_status: dict,
         pipeline_status_lock,
+        *,
+        doc_ids: tuple[str, ...] = (),
     ) -> bool:
         """Enter DRAIN_TO_IDLE for a manual retry (owner-checked, atomic).
 
@@ -3169,6 +3201,11 @@ class _PipelineMixin:
         while we still own ``busy`` — never a True freeze flag with no owner
         (LR2 §6.1). Returns False if we no longer own the slot."""
         owner = make_manual_owner_record(request_id, token)
+        if doc_ids:
+            # The mailbox remains the durable request source. This copy keeps
+            # the selected scope available after DRAIN_TO_IDLE reaches the
+            # exclusive reset phase.
+            owner["doc_ids"] = list(doc_ids)
 
         def _apply(status):
             status.update(
@@ -3268,7 +3305,10 @@ class _PipelineMixin:
         return await run_to_completion(_run)
 
     async def _next_failed_page(
-        self, position: CursorPosition
+        self,
+        position: CursorPosition,
+        *,
+        doc_ids: tuple[str, ...] = (),
     ) -> tuple[dict[str, DocProcessingStatus], CursorPosition]:
         """Fetch ONE bounded page of FAILED docs, hydrated to full status.
 
@@ -3278,6 +3318,16 @@ class _PipelineMixin:
         is the immutable ``(created_at, id)`` keyset. A strict page/hydration
         error propagates so the caller neither advances the cursor nor drops a
         FAILED row (it stays FAILED for the next run)."""
+        if doc_ids:
+            hydrated = await self.doc_status.get_full_docs_by_ids(
+                list(doc_ids), strict=True
+            )
+            return {
+                doc_id: doc
+                for doc_id, doc in hydrated.items()
+                if getattr(doc, "status", None) in {DocStatus.FAILED.value}
+            }, CURSOR_END
+
         page_size = getattr(self, "pipeline_scheduling_page_size", 0)
         if page_size <= 0:
             docs = await self.doc_status.get_docs_by_statuses(
@@ -3386,6 +3436,8 @@ class _PipelineMixin:
         token: str,
         pipeline_status: dict,
         pipeline_status_lock,
+        *,
+        doc_ids: tuple[str, ...] = (),
     ) -> bool:
         """Phase two (LR2 §7.3): page FAILED→PENDING with NO worker running.
 
@@ -3436,7 +3488,7 @@ class _PipelineMixin:
                 token, pipeline_status, pipeline_status_lock
             ):
                 return False
-            docs, cursor = await self._next_failed_page(cursor)
+            docs, cursor = await self._next_failed_page(cursor, doc_ids=doc_ids)
             pages += 1
             if docs:
                 total_reset += await self._reset_failed_page(
@@ -3455,7 +3507,8 @@ class _PipelineMixin:
 
         reset_message = (
             f"Manual retry {request_id[:8]}: reset {total_reset} FAILED "
-            "document(s) to PENDING (exclusive phase, no worker running)"
+            f"document(s) to PENDING (scope={'selected' if doc_ids else 'all'}, "
+            "exclusive phase, no worker running)"
         )
         logger.info(reset_message)
         async with pipeline_status_lock:
@@ -3903,6 +3956,7 @@ class _PipelineMixin:
                 return PipelineNextDecision(
                     PipelineNextStep.CONTINUE_MANUAL,
                     manual_request_id=manual_msg.request_id,
+                    manual_doc_ids=manual_msg.doc_ids,
                 )
             # The in-progress bounded sweep has more pages: finish draining the
             # KNOWN backlog before consuming any quiescence signal. Preempted
@@ -4024,6 +4078,7 @@ class _PipelineMixin:
                 token,
                 pipeline_status,
                 pipeline_status_lock,
+                doc_ids=decision.manual_doc_ids,
             ):
                 return {}, _AUTO_RESUME_DOC_STATUSES, CURSOR_END
         if step is PipelineNextStep.CONTINUE_DOCUMENT:
@@ -4112,9 +4167,14 @@ class _PipelineMixin:
         request_id = (manual_owner or {}).get("request_id")
         if request_id is None:
             return {}, _AUTO_RESUME_DOC_STATUSES, CURSOR_END
+        selected_doc_ids = tuple((manual_owner or {}).get("doc_ids") or ())
 
         if await self._run_exclusive_failed_reset(
-            request_id, token, pipeline_status, pipeline_status_lock
+            request_id,
+            token,
+            pipeline_status,
+            pipeline_status_lock,
+            doc_ids=selected_doc_ids,
         ):
             # ACK only after every FAILED→PENDING reset persisted (LR2 §7.3
             # completion point): a crash before this re-runs the reset; a crash
@@ -4866,6 +4926,7 @@ class _PipelineMixin:
         # terminal transition, where it survives the bounded pipeline-status
         # ring and reaches /documents and the WebUI.
         truncation_tally = TokenLimitTruncationTally()
+        degradation_tally = EntityExtractionDegradationTally()
         # Analyze-stage (multimodal VLM/EXTRACT) truncations arrive on the
         # hand-off dict: an accepted-but-truncated analysis feeds a partial
         # description into extraction below, so it belongs in the same
@@ -4881,6 +4942,12 @@ class _PipelineMixin:
                 analyze_truncation, truncation_tally.as_metadata()
             )
             return {LLM_TRUNCATION_METADATA_KEY: merged} if merged else {}
+
+        def degradation_metadata_extra() -> dict[str, Any]:
+            payload = degradation_tally.as_metadata()
+            return (
+                {ENTITY_EXTRACTION_DEGRADATION_METADATA_KEY: payload} if payload else {}
+            )
 
         def get_failed_chunk_snapshot() -> tuple[list[str], int]:
             if chunks:
@@ -5462,6 +5529,7 @@ class _PipelineMixin:
                             ctx.pipeline_status,
                             ctx.pipeline_status_lock,
                             truncation_tally=truncation_tally,
+                            degradation_tally=degradation_tally,
                         )
                     )
                     chunk_results = await entity_relation_task
@@ -5498,6 +5566,7 @@ class _PipelineMixin:
                         # A run that truncated and then failed keeps the
                         # evidence: truncation is often why it failed.
                         **truncation_metadata_extra(),
+                        **degradation_metadata_extra(),
                     },
                     pipeline_status=ctx.pipeline_status,
                     pipeline_status_lock=ctx.pipeline_status_lock,
@@ -5594,6 +5663,7 @@ class _PipelineMixin:
                             # carry-over whitelist, so absence means "this
                             # attempt did not truncate", never "unchanged".
                             **truncation_metadata_extra(),
+                            **degradation_metadata_extra(),
                         },
                         # A PROCESSED document has no purge in flight by
                         # definition, so retire any journal that a resume purge
@@ -5657,6 +5727,7 @@ class _PipelineMixin:
                             "process_end_time": int(time.time()),
                             **extraction_meta,
                             **truncation_metadata_extra(),
+                            **degradation_metadata_extra(),
                         },
                         pipeline_status=ctx.pipeline_status,
                         pipeline_status_lock=ctx.pipeline_status_lock,
@@ -6370,9 +6441,7 @@ class _PipelineMixin:
         summary-search first stage).
         """
         summary_opts = (content_data or {}).get("summary_options")
-        if not isinstance(summary_opts, dict) or not summary_opts.get(
-            "enable_summary"
-        ):
+        if not isinstance(summary_opts, dict) or not summary_opts.get("enable_summary"):
             return
         if not isinstance(content, str) or not content.strip():
             logger.warning(
