@@ -202,6 +202,59 @@ def test_split_long_block_uses_later_short_anchor():
 
 
 @pytest.mark.offline
+def test_split_long_block_does_not_anchor_inside_ocr_split_sentence():
+    """An OCR-inserted blank line must not divide one legal clause in two."""
+    tokenizer = _make_tokenizer()
+    fragment = "若乙方未在"
+    continuation = "上述时间内更换为合格产品的，甲方有权自行采购并向乙方追偿。"
+    blocks = _split_long_block(
+        [
+            {"text": "P" * 1000, "is_table": False},
+            {"text": fragment, "is_table": False},
+            {"text": continuation, "is_table": False},
+            {"text": "Q" * 1500, "is_table": False},
+        ],
+        heading="Section",
+        parent_headings=[],
+        level=2,
+        table_chunk_role="none",
+        tokenizer=tokenizer,
+        target_max=2000,
+        target_ideal=1500,
+        chunk_overlap_token_size=200,
+    )
+
+    contents = [block["content"] for block in blocks]
+    assert any(fragment in content and continuation in content for content in contents)
+    assert not any(
+        fragment in left and continuation in right
+        for left, right in zip(contents, contents[1:])
+    )
+
+
+@pytest.mark.offline
+def test_split_long_block_keeps_structural_unpunctuated_anchor():
+    """Numbered list items remain valid anchors without sentence punctuation."""
+    tokenizer = _make_tokenizer()
+    blocks = _split_long_block(
+        [
+            {"text": "P" * 1000, "is_table": False},
+            {"text": "1. 交付范围", "is_table": False},
+            {"text": "Q" * 1500, "is_table": False},
+        ],
+        heading="Section",
+        parent_headings=[],
+        level=2,
+        table_chunk_role="none",
+        tokenizer=tokenizer,
+        target_max=2000,
+        target_ideal=1500,
+    )
+
+    assert any(block["heading"] == "1. 交付范围" for block in blocks)
+
+
+@pytest.mark.offline
 def test_public_chunking_keeps_unsplit_heading_without_part_suffix(tmp_path):
     tokenizer = _make_tokenizer()
     blocks_path = _write_blocks_jsonl(
