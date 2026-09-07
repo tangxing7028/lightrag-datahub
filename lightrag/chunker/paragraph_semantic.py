@@ -65,6 +65,7 @@ from lightrag.table_markup import (
     detect_table_format as _detect_table_format,
     extract_table_id as _extract_table_id,
     serialize_html_rows as _serialize_rows_with_wrappers,
+    serialize_table_tag as _serialize_table_tag,
     split_html_rows as _split_html_rows,
 )
 from lightrag.utils import Tokenizer, logger
@@ -110,6 +111,15 @@ _PART_SUFFIX_RE = re.compile(r"\s*\[part\s+\d+\]\s*$", re.IGNORECASE)
 # "heading-only" block — one whose content carries nothing but heading lines —
 # can be detected without importing a private symbol across packages.
 _HEADING_LINE_RE = re.compile(r"^#{1,6} +")
+
+# A plain short line can be an OCR-induced sentence continuation rather than
+# a standalone paragraph. Keep structural labels eligible as anchors, but do
+# not split directly after a preceding short unfinished prose fragment.
+_SENTENCE_TERMINATOR_RE = re.compile(r"[。．.!？!?；;：:…][”’\"'）】》\]\)]*\s*$")
+_STRUCTURAL_ANCHOR_RE = re.compile(
+    r"^\s*(?:[-*+]\s+|\d+(?:[.．]\d+)*[、.．)）]\s+|"
+    r"\d+(?:[.．]\d+)+\s+|[（(]\d+[）)]\s+|[一二三四五六七八九十]+[、.．])"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -171,8 +181,49 @@ def _apply_part_suffixes(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _is_table_paragraph(text: str) -> bool:
-    stripped = text.strip()
-    return stripped.startswith("<table ") and stripped.endswith("</table>")
+    return bool(_TABLE_TAG_RE.fullmatch(text.strip()))
+
+
+def _is_structural_anchor(text: str) -> bool:
+    """Whether an unpunctuated short line is still a safe split anchor."""
+    return bool(_HEADING_LINE_RE.match(text) or _STRUCTURAL_ANCHOR_RE.match(text))
+
+
+def _ends_sentence(text: str) -> bool:
+    return bool(_SENTENCE_TERMINATOR_RE.search(text.strip()))
+
+
+def _is_anchor_candidate(paragraphs: list[dict[str, Any]], idx: int) -> bool:
+    """Return whether a short paragraph is safe to promote to an anchor.
+
+    MinerU can insert blank-line boundaries inside one OCR sentence. Splitting
+    at either half would discard the configured overlap used by the regular
+    fallback, so ordinary prose is only an anchor when it is sentence-complete
+    and does not continue an unfinished *short* preceding line. Lists and
+    headings are intentional structural boundaries and remain eligible without
+    punctuation.
+    """
+    para = paragraphs[idx]
+    text = para["text"]
+    if (
+        idx <= 0
+        or para.get("is_table", False)
+        or not (0 < len(text) <= _MAX_ANCHOR_CANDIDATE_LENGTH)
+    ):
+        return False
+    if _is_structural_anchor(text):
+        return True
+    if not _ends_sentence(text):
+        return False
+
+    previous = paragraphs[idx - 1]
+    previous_text = previous["text"]
+    if previous.get("is_table", False) or _is_structural_anchor(previous_text):
+        return True
+    return not (
+        0 < len(previous_text) <= _MAX_ANCHOR_CANDIDATE_LENGTH
+        and not _ends_sentence(previous_text)
+    )
 
 
 def _block_to_paragraphs(content: str) -> list[dict[str, Any]]:
@@ -421,7 +472,7 @@ def _inject_header_into_table_slice(text: str, header_body: str) -> str | None:
     header_fmt = _classify_header_format(header_body)
     if header_fmt is None:
         return None
-    attrs = match.group("attrs")
+    attrs = match.group("attrs") or ""
     body = match.group("body")
     slice_fmt = _detect_table_format(attrs, body)
 
@@ -452,14 +503,14 @@ def _inject_header_into_table_slice(text: str, header_body: str) -> str | None:
         # leading rows (which would corrupt a data row that happens to equal a
         # header row).
         merged = json.dumps(header_rows + rows, ensure_ascii=False)
-        return f"<table {attrs}>{merged}</table>"
+        return _serialize_table_tag(attrs, merged)
     if slice_fmt == "html":
         # header_fmt is guaranteed "html" here. If the slice already carries a
         # header (a <thead> the splitter kept when it cut inside a multi-row
         # header), prepending another would duplicate it — leave it as-is.
         if "<thead" in body.lower():
             return None
-        return f"<table {attrs}>{header_body}{body}</table>"
+        return _serialize_table_tag(attrs, f"{header_body}{body}")
     # slice_fmt is None (indeterminate): cannot establish consistency, so do
     # not inject and do not raise — leave the slice untouched.
     return None
@@ -723,7 +774,7 @@ def _split_table_text(
     match = _TABLE_TAG_RE.match((table_text or "").strip())
     if not match:
         return _character_split_text(table_text, tokenizer, target_max=target_max)
-    attrs = match.group("attrs")
+    attrs = match.group("attrs") or ""
     body = match.group("body")
     fmt = _detect_table_format(attrs, body)
 
@@ -732,7 +783,7 @@ def _split_table_text(
     # the body (json.dumps(rows) / "".join(rows)), so without this the
     # wrapped chunk can exceed target_max purely from the wrapper, which
     # would force a needless character-fallback below.
-    wrapper_overhead = _count_tokens(tokenizer, f"<table {attrs}></table>")
+    wrapper_overhead = _count_tokens(tokenizer, _serialize_table_tag(attrs, ""))
     # Classify the stored header once: a "json" header parses to row arrays
     # (pinned out of the JSON body and prepended on injection); an "html" header
     # is a raw <thead> fragment spliced verbatim into non-first HTML slices.
@@ -796,10 +847,8 @@ def _split_table_text(
             )
 
             def serialize(chunk_rows: list[Any]) -> str:
-                return (
-                    f"<table {attrs}>"
-                    f"{json.dumps(chunk_rows, ensure_ascii=False)}"
-                    f"</table>"
+                return _serialize_table_tag(
+                    attrs, json.dumps(chunk_rows, ensure_ascii=False)
                 )
 
     elif fmt == "html":
@@ -814,10 +863,8 @@ def _split_table_text(
             )
 
             def serialize(chunk_rows: list[tuple[str, str]]) -> str:
-                return (
-                    f"<table {attrs}>"
-                    f"{_serialize_rows_with_wrappers(chunk_rows)}"
-                    f"</table>"
+                return _serialize_table_tag(
+                    attrs, _serialize_rows_with_wrappers(chunk_rows)
                 )
 
     if row_chunks is None or serialize is None:
@@ -1182,7 +1229,7 @@ def _expand_block_with_table_splits(
         if table_headers:
             tag_match = _TABLE_TAG_RE.match(text.strip())
             if tag_match:
-                table_id = _extract_table_id(tag_match.group("attrs"))
+                table_id = _extract_table_id(tag_match.group("attrs") or "")
                 if table_id:
                     header_body = table_headers.get(table_id)
 
@@ -1208,9 +1255,7 @@ def _expand_block_with_table_splits(
 
         for chunk_idx, piece_text in enumerate(pieces):
             stripped = piece_text.strip()
-            is_still_table = stripped.startswith("<table ") and stripped.endswith(
-                "</table>"
-            )
+            is_still_table = _is_table_paragraph(stripped)
             chunk_para = {"text": piece_text, "is_table": is_still_table}
             is_first = chunk_idx == 0
             is_last = chunk_idx == len(pieces) - 1
@@ -1317,8 +1362,7 @@ def _split_long_block(
         text = para["text"]
         if (
             idx > 0
-            and not para.get("is_table", False)
-            and 0 < len(text) <= _MAX_ANCHOR_CANDIDATE_LENGTH
+            and _is_anchor_candidate(paragraphs, idx)
         ):
             candidates.append({"index": idx, "text": text, "position": cumulative})
         cumulative += _count_tokens(tokenizer, text)
@@ -1429,9 +1473,7 @@ def _split_long_block(
         sub_blocks: list[dict[str, Any]] = []
         for i, chunk_text in enumerate(chunks_text):
             stripped = chunk_text.strip()
-            is_still_table = stripped.startswith("<table ") and stripped.endswith(
-                "</table>"
-            )
+            is_still_table = _is_table_paragraph(stripped)
             sub_blocks.append(
                 _new_block(
                     heading=heading,

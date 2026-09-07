@@ -22,11 +22,13 @@ import re
 from typing import Any
 
 # Strict regex for a post-rewrite table tag emitted by the sidecar
-# writer (``lightrag.sidecar.writer``):
+# writer (``lightrag.sidecar.writer``), plus the attribute-less HTML emitted
+# by MinerU:
 #   <table id="tb-…" format="json"[ caption="…"]>{rows_json}</table>
+#   <table><tr>…</tr></table>
 # blocks.jsonl invariants guarantee the tag has no embedded newlines.
 TABLE_TAG_RE = re.compile(
-    r"<table\s+(?P<attrs>[^>]*)>(?P<body>.*?)</table>",
+    r"<table(?:\s+(?P<attrs>[^>]*))?>(?P<body>.*?)</table>",
     re.DOTALL,
 )
 
@@ -56,6 +58,14 @@ HTML_ROW_PARTS_RE = re.compile(
 HTML_WRAPPER_TAG_RE = re.compile(
     r"<(?P<slash>/?)(?P<name>thead|tbody|tfoot)\b", re.IGNORECASE
 )
+
+
+def serialize_table_tag(attrs: str | None, body: str) -> str:
+    """Return a legal table tag while preserving whether it had attributes."""
+    normalized_attrs = (attrs or "").strip()
+    if normalized_attrs:
+        return f"<table {normalized_attrs}>{body}</table>"
+    return f"<table>{body}</table>"
 
 
 def detect_table_format(attrs: str, body: str) -> str | None:
@@ -127,7 +137,7 @@ def parse_table_tag(text: str) -> tuple[str, list[Any]] | None:
         return None
     if not isinstance(rows, list):
         return None
-    return match.group("attrs"), rows
+    return match.group("attrs") or "", rows
 
 
 def split_html_rows(body: str) -> list[tuple[str, str]] | None:

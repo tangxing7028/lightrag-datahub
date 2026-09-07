@@ -36,8 +36,11 @@ class DoclingParser(ExternalParserBase):
         *,
         upload_name: str,
         engine_params: "Mapping[str, Any] | None" = None,
+        runtime_options: "Mapping[str, Any] | None" = None,
     ) -> None:
         from lightrag.parser.external.docling import DoclingRawClient
+
+        del runtime_options
 
         # Map the canonical ``upload_name`` onto docling-serve's multipart
         # filename so the bundle's main JSON is named ``<canonical_stem>.json``

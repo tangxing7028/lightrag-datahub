@@ -118,13 +118,16 @@ class PipelineIngressMessage:
     messages request a full status re-query: automatic ones
     (``retry_failed=False``) travel through the auto-rescan dirty flag, manual
     ones (``retry_failed=True``) through the sticky manual-retry channel keyed
-    by ``request_id``.
+    by ``request_id``. Manual messages may restrict their FAILED reset to
+    ``doc_ids``; an empty tuple retains the workspace-wide retry behavior.
     """
 
     kind: Literal["document", "rescan"]
     doc_id: str | None = None
     retry_failed: bool = False
     request_id: str | None = None
+    # Empty means "all FAILED documents" for a manual retry.
+    doc_ids: tuple[str, ...] = ()
 
 
 class ManualRetryPublishResult(str, Enum):
@@ -194,10 +197,10 @@ def _validate_document_message(msg: PipelineIngressMessage) -> None:
             "document channel requires kind='document' with a non-empty "
             f"doc_id (got {msg!r})"
         )
-    if msg.retry_failed or msg.request_id is not None:
+    if msg.retry_failed or msg.request_id is not None or msg.doc_ids:
         raise ValueError(
             "document messages must not carry control fields "
-            f"(retry_failed/request_id): {msg!r}"
+            f"(retry_failed/request_id/doc_ids): {msg!r}"
         )
 
 
@@ -209,6 +212,10 @@ def _validate_manual_request(request_id: str, msg: PipelineIngressMessage) -> No
             "manual retry message must be kind='rescan' with retry_failed=True "
             f"and a matching request_id (got {msg!r} for {request_id!r})"
         )
+    if any(not isinstance(doc_id, str) or not doc_id.strip() for doc_id in msg.doc_ids):
+        raise ValueError(f"manual retry doc_ids must be non-empty strings: {msg!r}")
+    if len(msg.doc_ids) != len(set(msg.doc_ids)):
+        raise ValueError(f"manual retry doc_ids must be unique: {msg!r}")
 
 
 @runtime_checkable

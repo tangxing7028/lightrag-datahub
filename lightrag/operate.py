@@ -10,6 +10,7 @@ import re
 import json_repair
 from typing import Any, AsyncIterator, overload, Literal, Callable, Awaitable
 from collections import Counter, defaultdict
+from tenacity import RetryError
 
 from lightrag.exceptions import (
     IndexFlushError,
@@ -37,6 +38,7 @@ from lightrag.utils import (
     CacheData,
     is_truncated_response,
     TokenLimitTruncationTally,
+    EntityExtractionDegradationTally,
     use_llm_func_with_cache,
     get_env_value,
     get_llm_cache_identity,
@@ -3795,6 +3797,51 @@ async def merge_nodes_and_edges(
         append_pipeline_history(pipeline_status, log_message)
 
 
+_EMPTY_OPENAI_CONTENT_PREFIX = "Received empty content from OpenAI API"
+_EMPTY_OPENAI_NO_OUTPUT_HINT = "model produced no output"
+
+
+def _is_exhausted_empty_openai_response(error: BaseException) -> bool:
+    """Return whether *error* is the narrow, recoverable empty-output case.
+
+    ``create_prefixed_exception`` intentionally preserves error context but
+    reconstructs some third-party exception types. For ``RetryError`` that
+    means the last-attempt future can be present only on a chained cause, so
+    inspect the complete explicit exception chain rather than trusting the
+    outermost wrapper. Other retry causes remain fatal.
+    """
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        if isinstance(current, RetryError):
+            last_attempt = getattr(current, "last_attempt", None)
+            try:
+                retry_cause = last_attempt.exception() if last_attempt else None
+            except BaseException:
+                retry_cause = None
+            if (
+                type(retry_cause).__name__ == "InvalidResponseError"
+                and type(retry_cause).__module__ == "lightrag.llm.openai"
+            ):
+                message = str(retry_cause)
+                if (
+                    _EMPTY_OPENAI_CONTENT_PREFIX in message
+                    and _EMPTY_OPENAI_NO_OUTPUT_HINT in message
+                ):
+                    return True
+
+        for linked in (current.__cause__, current.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    return False
+
+
 async def extract_entities(
     chunks: dict[str, TextChunkSchema],
     global_config: dict[str, str],
@@ -3803,6 +3850,7 @@ async def extract_entities(
     llm_response_cache: BaseKVStorage | None = None,
     text_chunks_storage: BaseKVStorage | None = None,
     truncation_tally: TokenLimitTruncationTally | None = None,
+    degradation_tally: EntityExtractionDegradationTally | None = None,
 ) -> list:
     """Extract entities and relations from ``chunks``.
 
@@ -3827,6 +3875,10 @@ async def extract_entities(
 
     # Extraction-scoped truncation tally; see _publish_truncation_summary below.
     stage_tally = TokenLimitTruncationTally()
+    # Stage-scoped record for a narrowly recoverable model failure. It is
+    # folded into the caller's document tally at the same every-exit boundary
+    # as truncation so a later merge failure cannot hide the degradation.
+    stage_degradation_tally = EntityExtractionDegradationTally()
 
     use_llm_func: callable = global_config["role_llm_funcs"]["extract"]
     entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
@@ -3962,6 +4014,22 @@ async def extract_entities(
                     f"reported as one summary at the end of extraction"
                 )
 
+        def _report_empty_model_output(stage: str) -> None:
+            first = stage_degradation_tally.record(stage, chunk_key)
+            location = f"chunk {chunk_key} in {file_path}"
+            logger.warning(
+                "Entity extraction degraded for %s: the model returned no "
+                "content after all retry attempts; retaining chunk text and "
+                "vectors but omitting this chunk's entities and relations",
+                location,
+            )
+            if first:
+                status_logger.log(
+                    "Warning: entity extraction received no model content "
+                    f"after retries for {location}; the affected chunks retain "
+                    "text/vector retrieval but omit graph entities and relations"
+                )
+
         if use_json_extraction:
             # JSON mode: use JSON prompts and pass entity_extraction flag to LLM provider
             entity_extraction_system_prompt = PROMPTS[
@@ -3997,17 +4065,26 @@ async def extract_entities(
                 "entity_continue_extraction_user_prompt"
             ].format(**{**context_base, "input_text": content})
 
-        final_result, timestamp = await use_llm_func_with_cache(
-            entity_extraction_user_prompt,
-            use_llm_func,
-            system_prompt=entity_extraction_system_prompt,
-            llm_response_cache=llm_response_cache,
-            cache_type="extract",
-            chunk_id=chunk_key,
-            cache_keys_collector=cache_keys_collector,
-            response_format=({"type": "json_object"} if use_json_extraction else None),
-            llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
-        )
+        try:
+            final_result, timestamp = await use_llm_func_with_cache(
+                entity_extraction_user_prompt,
+                use_llm_func,
+                system_prompt=entity_extraction_system_prompt,
+                llm_response_cache=llm_response_cache,
+                cache_type="extract",
+                chunk_id=chunk_key,
+                cache_keys_collector=cache_keys_collector,
+                response_format=(
+                    {"type": "json_object"} if use_json_extraction else None
+                ),
+                llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+            )
+        except Exception as error:
+            if not _is_exhausted_empty_openai_response(error):
+                raise
+            _report_empty_model_output("initial")
+            processed_chunks += 1
+            return {}, {}
 
         _report_truncation(final_result, "initial")
 
@@ -4064,79 +4141,90 @@ async def extract_entities(
                 run_gleaning = False
 
         if run_gleaning:
-            glean_result, timestamp = await use_llm_func_with_cache(
-                entity_continue_extraction_user_prompt,
-                use_llm_func,
-                system_prompt=entity_extraction_system_prompt,
-                llm_response_cache=llm_response_cache,
-                history_messages=history,
-                cache_type="extract",
-                chunk_id=chunk_key,
-                cache_keys_collector=cache_keys_collector,
-                response_format=(
-                    {"type": "json_object"} if use_json_extraction else None
-                ),
-                llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
-            )
-
-            _report_truncation(glean_result, "gleaning")
-
-            # Process gleaning result with appropriate parser
-            if use_json_extraction:
-                glean_nodes, glean_edges = await _process_json_extraction_result(
-                    glean_result,
-                    chunk_key,
-                    timestamp,
-                    file_path,
+            try:
+                glean_result, timestamp = await use_llm_func_with_cache(
+                    entity_continue_extraction_user_prompt,
+                    use_llm_func,
+                    system_prompt=entity_extraction_system_prompt,
+                    llm_response_cache=llm_response_cache,
+                    history_messages=history,
+                    cache_type="extract",
+                    chunk_id=chunk_key,
+                    cache_keys_collector=cache_keys_collector,
+                    response_format=(
+                        {"type": "json_object"} if use_json_extraction else None
+                    ),
+                    llm_cache_identity=get_llm_cache_identity(
+                        global_config, "extract"
+                    ),
                 )
-            else:
-                glean_nodes, glean_edges = await _process_extraction_result(
-                    glean_result,
-                    chunk_key,
-                    timestamp,
-                    file_path,
-                    tuple_delimiter=context_base["tuple_delimiter"],
-                    completion_delimiter=context_base["completion_delimiter"],
-                )
+            except Exception as error:
+                if not _is_exhausted_empty_openai_response(error):
+                    raise
+                _report_empty_model_output("gleaning")
+                run_gleaning = False
 
-            # Merge results - compare description lengths to choose better version
-            for i, (entity_name, glean_entities) in enumerate(
-                glean_nodes.items(), start=1
-            ):
-                if entity_name in maybe_nodes:
-                    # Compare description lengths and keep the better one
-                    original_desc_len = len(
-                        maybe_nodes[entity_name][0].get("description", "") or ""
+            if run_gleaning:
+                _report_truncation(glean_result, "gleaning")
+
+                # Process gleaning result with appropriate parser
+                if use_json_extraction:
+                    glean_nodes, glean_edges = await _process_json_extraction_result(
+                        glean_result,
+                        chunk_key,
+                        timestamp,
+                        file_path,
                     )
-                    glean_desc_len = len(glean_entities[0].get("description", "") or "")
+                else:
+                    glean_nodes, glean_edges = await _process_extraction_result(
+                        glean_result,
+                        chunk_key,
+                        timestamp,
+                        file_path,
+                        tuple_delimiter=context_base["tuple_delimiter"],
+                        completion_delimiter=context_base["completion_delimiter"],
+                    )
 
-                    if glean_desc_len > original_desc_len:
+                # Merge results - compare description lengths to choose better version
+                for i, (entity_name, glean_entities) in enumerate(
+                    glean_nodes.items(), start=1
+                ):
+                    if entity_name in maybe_nodes:
+                        # Compare description lengths and keep the better one
+                        original_desc_len = len(
+                            maybe_nodes[entity_name][0].get("description", "") or ""
+                        )
+                        glean_desc_len = len(
+                            glean_entities[0].get("description", "") or ""
+                        )
+
+                        if glean_desc_len > original_desc_len:
+                            maybe_nodes[entity_name] = list(glean_entities)
+                        # Otherwise keep original version
+                    else:
+                        # New entity from gleaning stage
                         maybe_nodes[entity_name] = list(glean_entities)
-                    # Otherwise keep original version
-                else:
-                    # New entity from gleaning stage
-                    maybe_nodes[entity_name] = list(glean_entities)
-                await _cooperative_yield(i, every=8)
+                    await _cooperative_yield(i, every=8)
 
-            for i, (edge_key, glean_edge_list) in enumerate(
-                glean_edges.items(), start=1
-            ):
-                if edge_key in maybe_edges:
-                    # Compare description lengths and keep the better one
-                    original_desc_len = len(
-                        maybe_edges[edge_key][0].get("description", "") or ""
-                    )
-                    glean_desc_len = len(
-                        glean_edge_list[0].get("description", "") or ""
-                    )
+                for i, (edge_key, glean_edge_list) in enumerate(
+                    glean_edges.items(), start=1
+                ):
+                    if edge_key in maybe_edges:
+                        # Compare description lengths and keep the better one
+                        original_desc_len = len(
+                            maybe_edges[edge_key][0].get("description", "") or ""
+                        )
+                        glean_desc_len = len(
+                            glean_edge_list[0].get("description", "") or ""
+                        )
 
-                    if glean_desc_len > original_desc_len:
+                        if glean_desc_len > original_desc_len:
+                            maybe_edges[edge_key] = list(glean_edge_list)
+                        # Otherwise keep original version
+                    else:
+                        # New edge from gleaning stage
                         maybe_edges[edge_key] = list(glean_edge_list)
-                    # Otherwise keep original version
-                else:
-                    # New edge from gleaning stage
-                    maybe_edges[edge_key] = list(glean_edge_list)
-                await _cooperative_yield(i, every=8)
+                    await _cooperative_yield(i, every=8)
 
         # Inject multimodal entity + associations for drawing/table/equation
         # chunks. Placed before update_chunk_cache_list so the per-chunk
@@ -4250,6 +4338,20 @@ async def extract_entities(
         if truncation_tally is not None:
             truncation_tally.absorb(stage_tally)
 
+    def _publish_degradation_summary() -> None:
+        if not stage_degradation_tally:
+            return
+        degradation_message = (
+            "Warning: entity extraction received no model output after retries for "
+            f"{stage_degradation_tally.affected} of {total_chunks} chunks "
+            f"({stage_degradation_tally.stage_breakdown()}); affected chunks retain "
+            "text/vector retrieval but have no graph entities or relations"
+        )
+        logger.warning(degradation_message)
+        status_logger.log(degradation_message)
+        if degradation_tally is not None:
+            degradation_tally.absorb(stage_degradation_tally)
+
     # Get max async tasks limit from global_config
     chunk_max_async = global_config.get("llm_model_max_async", 4)
     semaphore = asyncio.Semaphore(chunk_max_async)
@@ -4348,6 +4450,7 @@ async def extract_entities(
         # persisted FAILED with no llm_truncation for responses that had
         # already been recorded. Await-free, called exactly once.
         _publish_truncation_summary()
+        _publish_degradation_summary()
 
     # If all tasks completed successfully, chunk_results already contains the results
     # Return the chunk_results for later processing in merge_nodes_and_edges

@@ -46,6 +46,7 @@ from lightrag.parser.routing import (
 )
 from lightrag.utils import (
     compute_mdhash_id,
+    ENTITY_EXTRACTION_DEGRADATION_METADATA_KEY,
     get_content_summary,
     LLM_TRUNCATION_METADATA_KEY,
     logger,
@@ -647,6 +648,9 @@ _DOC_STATUS_METADATA_ATTEMPT_KEYS: frozenset[str] = frozenset(
         # output budget must start from a clean slate, and the terminal
         # transition rewrites the key only when the new attempt truncated too.
         LLM_TRUNCATION_METADATA_KEY,
+        # Recoverable-but-degraded entity extraction is attempt-scoped too: a
+        # clean retry must not keep advertising a prior empty model response.
+        ENTITY_EXTRACTION_DEGRADATION_METADATA_KEY,
     }
 )
 

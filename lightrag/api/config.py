@@ -8,6 +8,9 @@ import argparse
 import logging
 from dotenv import load_dotenv
 from lightrag import ROLES
+from lightrag.api.datahub_internal_auth import (
+    resolve_datahub_internal_openai_api_key,
+)
 from lightrag.utils import get_env_value, logger
 from lightrag.llm.binding_options import (
     BedrockLLMOptions,
@@ -672,8 +675,16 @@ def parse_args() -> argparse.Namespace:
     args.embedding_binding_host = get_env_value(
         "EMBEDDING_BINDING_HOST", get_default_host(args.embedding_binding)
     )
-    args.llm_binding_api_key = get_env_value("LLM_BINDING_API_KEY", None)
-    args.embedding_binding_api_key = get_env_value("EMBEDDING_BINDING_API_KEY", "")
+    args.llm_binding_api_key = resolve_datahub_internal_openai_api_key(
+        binding=args.llm_binding,
+        base_url=args.llm_binding_host,
+        configured_api_key=get_env_value("LLM_BINDING_API_KEY", None),
+    )
+    args.embedding_binding_api_key = resolve_datahub_internal_openai_api_key(
+        binding=args.embedding_binding,
+        base_url=args.embedding_binding_host,
+        configured_api_key=get_env_value("EMBEDDING_BINDING_API_KEY", ""),
+    )
 
     args.aws_region = get_env_value("AWS_REGION", None, special_none=True)
     args.aws_access_key_id = get_env_value("AWS_ACCESS_KEY_ID", None, special_none=True)
@@ -726,7 +737,11 @@ def parse_args() -> argparse.Namespace:
         )
         role_model = get_env_value(model_key, None, special_none=True)
         role_host = get_env_value(host_key, None, special_none=True)
-        role_apikey = get_env_value(apikey_key, None, special_none=True)
+        role_apikey = resolve_datahub_internal_openai_api_key(
+            binding=role_binding or args.llm_binding,
+            base_url=role_host or args.llm_binding_host,
+            configured_api_key=get_env_value(apikey_key, None, special_none=True),
+        )
         role_max_async = get_env_value(max_async_key, None, int, special_none=True)
         role_timeout = get_env_value(timeout_key, None, int, special_none=True)
         role_aws_region = get_env_value(f"{prefix}_AWS_REGION", None, special_none=True)

@@ -416,6 +416,27 @@ def _upload_filename_with_directives(
     return f"{source[: -len(suffix)]}.[{engine_token}]{suffix}"
 
 
+def _storage_filename_for_doc_id(filename: str, doc_id: str | None) -> str:
+    """Return the runtime-private filename for a caller-owned document id.
+
+    DataHub owns document identity through its ``doc_id`` form field. Its
+    source archive and dataset rows may therefore legitimately contain two
+    files with the same user-visible name. LightRAG's input directory still
+    needs a distinct physical basename because that basename participates in
+    the parser cache and the legacy duplicate guard.
+
+    Prefixing instead of replacing the supplied name keeps a terminal parser
+    hint intact: ``report.[mineru-ite].pdf`` becomes
+    ``__datahub_doc_<id>__report.[mineru-ite].pdf``. The prefix is runtime
+    private; ai-service continues to render its own persisted display name.
+    Callers without a ``doc_id`` retain the historical filename-as-identity
+    behaviour.
+    """
+    if not doc_id:
+        return filename
+    return f"__datahub_doc_{doc_id}__{filename}"
+
+
 def _parse_upload_chunking(value: str | None) -> "TextChunkingConfig | None":
     """Decode the JSON multipart chunking contract before enqueueing bytes."""
     if value is None or not isinstance(value, str) or not value.strip():
@@ -796,6 +817,40 @@ class SourceConflictRepairResponse(BaseModel):
     )
 
 
+class ReprocessFailedRequest(BaseModel):
+    """Optional scope for a manual FAILED-document retry.
+
+    An omitted or empty ``doc_ids`` list retains the historical workspace-wide
+    behavior. DataHub's batch retry supplies a selected set so unrelated failed
+    documents are not reset.
+    """
+
+    doc_ids: List[str] = Field(
+        default_factory=list,
+        description="Optional bounded list of FAILED document IDs to retry.",
+    )
+
+    @field_validator("doc_ids", mode="after")
+    @classmethod
+    def validate_doc_ids(cls, doc_ids: List[str]) -> List[str]:
+        if len(doc_ids) > 512:
+            raise ValueError("At most 512 document IDs may be retried at once")
+        validated_ids = []
+        for doc_id in doc_ids:
+            if not doc_id or not doc_id.strip():
+                raise ValueError("Document ID cannot be empty")
+            normalized = doc_id.strip()
+            if (
+                len(normalized) > MAX_CUSTOM_DOC_ID_LENGTH
+                or not _CUSTOM_DOC_ID_PATTERN.fullmatch(normalized)
+            ):
+                raise ValueError("Document ID has an invalid format")
+            validated_ids.append(normalized)
+        if len(validated_ids) != len(set(validated_ids)):
+            raise ValueError("Document IDs must be unique")
+        return validated_ids
+
+
 class ReprocessResponse(BaseModel):
     """Response model for reprocessing failed documents operation
 
@@ -803,6 +858,8 @@ class ReprocessResponse(BaseModel):
         status: Status of the reprocessing operation
         message: Message describing the operation result
         track_id: Always empty string. Reprocessed documents retain their original track_id.
+        documents: Existing selected documents and their persistent track IDs.
+        missing_doc_ids: Selected IDs that have no runtime document record.
     """
 
     status: Literal["reprocessing_started"] = Field(
@@ -813,6 +870,20 @@ class ReprocessResponse(BaseModel):
         default="",
         description="Always empty string. Reprocessed documents retain their original track_id from initial upload.",
     )
+    documents: List["ReprocessDocumentRef"] = Field(
+        default_factory=list,
+        description=(
+            "Selected documents that exist in runtime storage, including the "
+            "persistent track_id used to monitor the retry."
+        ),
+    )
+    missing_doc_ids: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Selected document IDs absent from runtime storage. Only these IDs "
+            "may be uploaded again by a caller."
+        ),
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -820,9 +891,27 @@ class ReprocessResponse(BaseModel):
                 "status": "reprocessing_started",
                 "message": "Reprocessing of failed documents has been initiated in background",
                 "track_id": "",
+                "documents": [
+                    {
+                        "doc_id": "doc-123",
+                        "track_id": "track-123",
+                        "status": "failed",
+                    }
+                ],
+                "missing_doc_ids": ["doc-456"],
             }
         }
     )
+
+
+class ReprocessDocumentRef(BaseModel):
+    """Runtime identity returned for one selected failed-document retry."""
+
+    doc_id: str = Field(description="Persistent runtime document ID")
+    track_id: str = Field(
+        description="Persistent runtime upload track ID; may be empty for legacy rows"
+    )
+    status: str = Field(description="Current runtime document status")
 
 
 class CancelPipelineResponse(BaseModel):
@@ -1891,6 +1980,100 @@ def get_doc_track_id(doc_status: Any) -> str:
         else getattr(doc_status, "track_id", None)
     )
     return str(track_id or "")
+
+
+_ORPHANED_UPLOAD_RETRY_STATUSES = frozenset(
+    {
+        DocStatus.PENDING.value,
+        DocStatus.PARSING.value,
+        DocStatus.ANALYZING.value,
+        DocStatus.PROCESSING.value,
+    }
+)
+
+
+async def can_retire_orphaned_document_for_reupload(
+    rag: LightRAG, *, doc_id: str, enqueue_token: str
+) -> bool:
+    """Prove that a non-terminal DataHub document is safe to replace.
+
+    A caller-assigned ID normally stays immutable while it is non-terminal.
+    The one exception is a process-restart orphan: the pipeline must be idle,
+    this request must be its only pending ingress reservation, and MinerU must
+    have no active or recovery lease for the same workspace/document. Failure
+    to inspect any of those conditions is a refusal, not permission to delete.
+    """
+    from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
+    from lightrag.parser.external.mineru.scheduling import (
+        mineru_document_has_active_lease,
+    )
+
+    try:
+        pipeline_status = await get_namespace_data(
+            "pipeline_status", workspace=rag.workspace
+        )
+        pipeline_status_lock = get_namespace_lock(
+            "pipeline_status", workspace=rag.workspace
+        )
+        async with pipeline_status_lock:
+            pending_tokens = dict(
+                pipeline_status.get("pending_enqueue_tokens", {}) or {}
+            )
+            only_this_request = (
+                set(pending_tokens) == {enqueue_token}
+                and int(pipeline_status.get("pending_enqueues") or 0) == 1
+            )
+            pipeline_idle = not any(
+                pipeline_status.get(key)
+                for key in (
+                    "busy",
+                    "destructive_busy",
+                    "scanning",
+                    "scanning_exclusive",
+                    "manual_freeze_requested",
+                    "manual_resetting",
+                    "recovery_required",
+                )
+            )
+            if not pipeline_idle or not only_this_request:
+                return False
+            return not await mineru_document_has_active_lease(
+                str(rag.workspace or ""), doc_id
+            )
+    except Exception as recovery_check_error:
+        logger.warning(
+            "/documents/upload cannot verify orphan recovery for doc_id=%s: %s",
+            doc_id,
+            recovery_check_error,
+        )
+        return False
+
+
+async def get_reprocess_document_refs(
+    doc_status: Any, doc_ids: tuple[str, ...]
+) -> tuple[List[ReprocessDocumentRef], List[str]]:
+    """Resolve selected retry IDs before publishing their manual retry intent.
+
+    The caller needs the original ``track_id`` to monitor an in-place retry.
+    A record absent from doc_status is explicitly marked missing so callers can
+    distinguish it from an older runtime that failed to return identity data.
+    """
+
+    documents: List[ReprocessDocumentRef] = []
+    missing_doc_ids: List[str] = []
+    for doc_id in doc_ids:
+        existing = await doc_status.get_by_id(doc_id)
+        if existing is None:
+            missing_doc_ids.append(doc_id)
+            continue
+        documents.append(
+            ReprocessDocumentRef(
+                doc_id=doc_id,
+                track_id=get_doc_track_id(existing),
+                status=get_doc_status_value(existing),
+            )
+        )
+    return documents, missing_doc_ids
 
 
 async def get_existing_doc_by_file_path_candidates(
@@ -5485,8 +5668,8 @@ def create_document_routes(
                 document's full_doc_id instead of ``md5(canonical file_path)``;
                 track_status / doc_status responses key off it. A workspace that
                 already holds this id returns 409, unless the existing document
-                is FAILED — then the failed record is deleted first and the
-                upload proceeds as a clean retry.
+                is FAILED or a verified idle, lease-free restart orphan. Only
+                then is the old record deleted before a clean retry.
 
         Returns:
             InsertResponse: A response object containing the upload status and a message.
@@ -5603,22 +5786,34 @@ def create_document_routes(
                         f"File size not available in UploadFile for {safe_filename}, will check during streaming"
                     )
 
-            file_path = effective_input_dir / safe_filename
-
             # Optional caller-assigned doc id. Validate and retire an existing
-            # FAILED record before the canonical-name and input-file checks.
-            # A retry uses the same display filename, so checking the name
-            # first would reject the request before this sanctioned cleanup
-            # path could run. Requests without the original doc id retain the
-            # strict duplicate-name behavior below.
+            # FAILED record before the storage-name and input-file checks. A
+            # non-terminal record can be retired only when it is proven to be
+            # an idle, lease-free process-restart orphan.
+            # DataHub gives each document a durable id, so its caller-owned
+            # uploads use a distinct runtime-private physical basename. This
+            # keeps two documents with the same display filename independent
+            # while leaving direct LightRAG uploads on the historical strict
+            # filename-unique path.
             requested_doc_id = validate_custom_doc_id(doc_id)
+            storage_filename = _storage_filename_for_doc_id(
+                safe_filename, requested_doc_id
+            )
+            file_path = effective_input_dir / storage_filename
             if requested_doc_id is not None:
                 existing_by_id = await rag.doc_status.get_by_id(requested_doc_id)
                 if existing_by_id:
                     existing_id_status = (
                         get_doc_status_value(existing_by_id) or "unknown"
                     )
-                    if existing_id_status != DocStatus.FAILED.value:
+                    can_retire = existing_id_status == DocStatus.FAILED.value
+                    if existing_id_status in _ORPHANED_UPLOAD_RETRY_STATUSES:
+                        can_retire = await can_retire_orphaned_document_for_reupload(
+                            rag,
+                            doc_id=requested_doc_id,
+                            enqueue_token=enqueue_token,
+                        )
+                    if not can_retire:
                         raise HTTPException(
                             status_code=409,
                             detail=(
@@ -5630,7 +5825,7 @@ def create_document_routes(
                     retry_file_path = (
                         existing_by_id.get("file_path")
                         if isinstance(existing_by_id, dict)
-                        else None
+                        else getattr(existing_by_id, "file_path", None)
                     )
                     deletion = await rag.adelete_by_doc_id(requested_doc_id)
                     if deletion.status == "not_allowed":
@@ -7217,11 +7412,13 @@ def create_document_routes(
     )
     async def reprocess_failed_documents(
         managed_tasks: set = Depends(get_managed_background_tasks),
+        request: ReprocessFailedRequest | None = None,
         rag: LightRAG = resolve_request_rag,
     ):
         """
         Reprocess existing failed, pending, or interrupted document records
-        without scanning the input directory for new files.
+        without scanning the input directory for new files. ``request.doc_ids``
+        can restrict the FAILED reset to selected documents.
 
         Pure storage-driven recovery: this endpoint publishes a sticky manual
         retry request into the workspace ingress and drives the processing
@@ -7244,8 +7441,10 @@ def create_document_routes(
 
         Returns:
             ReprocessResponse: Response with status and message.
-                track_id is always empty string because reprocessed documents
-                retain their original track_id from initial upload.
+                ``documents`` maps every selected existing runtime document to
+                its original track_id. ``missing_doc_ids`` is explicit so a
+                caller never mistakes an incomplete response for permission to
+                upload a duplicate.
 
         Raises:
             HTTPException: 503 when the workspace is fenced (recovery
@@ -7264,6 +7463,16 @@ def create_document_routes(
         )
 
         request_id = uuid4().hex
+        retry_doc_ids = tuple(request.doc_ids) if request is not None else ()
+
+        try:
+            selected_documents, missing_doc_ids = await get_reprocess_document_refs(
+                rag.doc_status, retry_doc_ids
+            )
+        except Exception as e:
+            logger.error(f"Error resolving failed documents for retry: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise internal_server_error(e)
 
         try:
             pipeline_status = await get_namespace_data(
@@ -7291,6 +7500,8 @@ def create_document_routes(
                     status="reprocessing_started",
                     message="Reprocessing of failed documents has been initiated "
                     "in background. Documents retain their original track_id.",
+                    documents=selected_documents,
+                    missing_doc_ids=missing_doc_ids,
                 )
             except Exception as e:
                 logger.error(f"Error initiating reprocessing: {str(e)}")
@@ -7318,6 +7529,7 @@ def create_document_routes(
                 ingress,
                 request_id,
                 state,
+                doc_ids=retry_doc_ids,
             )
 
         async def _work():
@@ -7334,7 +7546,8 @@ def create_document_routes(
                 backstop_release=_noop_backstop,
             )
             logger.info(
-                f"Reprocessing of failed documents initiated (request {request_id})"
+                "Reprocessing of failed documents initiated "
+                f"(request {request_id}, selected={len(retry_doc_ids) or 'all'})"
             )
             return ReprocessResponse(
                 status="reprocessing_started",
@@ -7342,6 +7555,8 @@ def create_document_routes(
                 "background (one retry attempt per failed document). If the "
                 "pipeline is busy the request executes at its next quiescence "
                 "point. Documents retain their original track_id.",
+                documents=selected_documents,
+                missing_doc_ids=missing_doc_ids,
             )
         except ManualIntentRefused as refusal:
             # 429 only for a full manual channel (retry later works); every other

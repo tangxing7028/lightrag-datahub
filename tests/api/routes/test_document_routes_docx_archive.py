@@ -182,6 +182,9 @@ class _ScanDocStatus:
     async def get_doc_by_file_path(self, file_path):
         return self.docs_by_path.get(file_path)
 
+    async def get_by_id(self, doc_id):
+        return self.docs_by_path.get(doc_id)
+
     async def get_doc_by_file_basename(self, basename):
         # Still the upload path's duplicate check (the SCAN moved to the typed
         # resolver below); a single primary row per basename is all it models.
@@ -1287,9 +1290,9 @@ async def test_upload_retries_failed_doc_by_id_before_same_name_check(
 ):
     """DataHub retries reuse the original doc_id and display filename.
 
-    The failed-record cleanup must happen before the canonical-name guard;
+    The failed-record cleanup must happen before the doc-id storage-name guard;
     otherwise the retry is rejected with the same 409 that protects ordinary
-    duplicate uploads.
+    duplicate uploads. The new physical file is private to that document id.
     """
     monkeypatch.setattr(
         _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
@@ -1340,7 +1343,212 @@ async def test_upload_retries_failed_doc_by_id_before_same_name_check(
     assert rag.deleted_doc_ids == [(failed_doc_id, False)]
     assert len(calls) == 1
     assert calls[0]["doc_id"] == failed_doc_id
-    assert any(path.name == failed_file_path for path in tmp_path.rglob("*"))
+    storage_file_path = f"__datahub_doc_{failed_doc_id}__{failed_file_path}"
+    assert any(path.name == storage_file_path for path in tmp_path.rglob("*"))
+
+
+async def test_upload_recovers_idle_orphaned_document_by_id(tmp_path, monkeypatch):
+    """A non-terminal row can be replaced only after the pipeline went idle."""
+    import importlib
+
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://fake-mineru")
+    doc_id = "doc-orphaned-parse"
+    old_file_path = "orphaned.[mineru-ite].docx"
+    rag = _RetryUploadRag(
+        doc_id,
+        {
+            "status": DocStatus.PARSING.value,
+            "file_path": old_file_path,
+            "track_id": "track-orphaned",
+        },
+    )
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    doc_manager = DocumentManager(str(tmp_path))
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    managed_tasks = set()
+    calls = []
+
+    async def capture_pipeline(*args, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(_document_routes, "pipeline_index_file", capture_pipeline)
+    response = await upload_endpoint(
+        managed_tasks=managed_tasks,
+        file=_document_routes.UploadFile(
+            filename="orphaned.docx", file=BytesIO(b"replacement docx bytes")
+        ),
+        doc_id=doc_id,
+        parser="mineru",
+        parse_method="auto",
+        enable_image="true",
+        enable_table="true",
+        enable_equation="true",
+        skip_entity_extract="false",
+        rag=rag,
+    )
+    await _await_managed(managed_tasks)
+
+    assert response.status == "success"
+    assert rag.deleted_doc_ids == [(doc_id, False)]
+    assert [call["doc_id"] for call in calls] == [doc_id]
+
+
+async def test_upload_keeps_nonterminal_document_with_mineru_lease(tmp_path, monkeypatch):
+    """A live or timeout-recovery MinerU task must retain its runtime row."""
+    import importlib
+
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_id = "doc-live-mineru"
+    rag = _RetryUploadRag(
+        doc_id,
+        {
+            "status": DocStatus.PARSING.value,
+            "file_path": "live.[mineru-ite].docx",
+            "track_id": "track-live",
+        },
+    )
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    scheduling = importlib.import_module("lightrag.parser.external.mineru.scheduling")
+    lease, _ = await shared_storage.try_acquire_weighted_lease(
+        scheduling.LEASE_GROUP,
+        kb_key=rag.workspace,
+        weight=1,
+        global_capacity=4,
+        per_kb_capacity=4,
+        waiter_id="upload-live-mineru",
+        metadata={"doc_id": doc_id},
+    )
+    assert lease
+
+    doc_manager = DocumentManager(str(tmp_path))
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    try:
+        with pytest.raises(_document_routes.HTTPException) as excinfo:
+            await upload_endpoint(
+                managed_tasks=set(),
+                file=_document_routes.UploadFile(
+                    filename="live.docx", file=BytesIO(b"replacement docx bytes")
+                ),
+                doc_id=doc_id,
+                rag=rag,
+            )
+        assert excinfo.value.status_code == 409
+        assert "Status: parsing" in excinfo.value.detail
+        assert rag.deleted_doc_ids == []
+    finally:
+        assert await shared_storage.release_weighted_lease(
+            scheduling.LEASE_GROUP, lease["lease_id"]
+        )
+
+
+async def test_upload_keeps_nonterminal_document_while_pipeline_busy(
+    tmp_path, monkeypatch
+):
+    """A local processing row remains immutable while another run owns busy."""
+    import importlib
+
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_id = "doc-busy-pipeline"
+    rag = _RetryUploadRag(
+        doc_id,
+        {
+            "status": DocStatus.PENDING.value,
+            "file_path": "busy.[mineru-ite].docx",
+            "track_id": "track-busy",
+        },
+    )
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["busy"] = True
+
+    doc_manager = DocumentManager(str(tmp_path))
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    try:
+        with pytest.raises(_document_routes.HTTPException) as excinfo:
+            await upload_endpoint(
+                managed_tasks=set(),
+                file=_document_routes.UploadFile(
+                    filename="busy.docx", file=BytesIO(b"replacement docx bytes")
+                ),
+                doc_id=doc_id,
+                rag=rag,
+            )
+        assert excinfo.value.status_code == 409
+        assert rag.deleted_doc_ids == []
+    finally:
+        pipeline_status["busy"] = False
+
+
+async def test_upload_keeps_orphaned_document_when_another_enqueue_is_pending(
+    tmp_path, monkeypatch
+):
+    """A second ingress reservation prevents an orphan-recovery delete race."""
+    import importlib
+
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_id = "doc-pending-ingress"
+    rag = _RetryUploadRag(
+        doc_id,
+        {
+            "status": DocStatus.PENDING.value,
+            "file_path": "pending.[mineru-ite].docx",
+            "track_id": "track-pending",
+        },
+    )
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    other_token = "other-upload-reservation"
+    assert await _document_routes._reserve_enqueue_slot(rag, other_token)
+
+    doc_manager = DocumentManager(str(tmp_path))
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    try:
+        with pytest.raises(_document_routes.HTTPException) as excinfo:
+            await upload_endpoint(
+                managed_tasks=set(),
+                file=_document_routes.UploadFile(
+                    filename="pending.docx", file=BytesIO(b"replacement docx bytes")
+                ),
+                doc_id=doc_id,
+                rag=rag,
+            )
+        assert excinfo.value.status_code == 409
+        assert rag.deleted_doc_ids == []
+    finally:
+        await _document_routes._release_enqueue_slot(rag, other_token)
 
 
 async def test_upload_rejects_parser_hinted_filesystem_duplicate(tmp_path, monkeypatch):
@@ -3170,6 +3378,95 @@ async def test_reprocess_starts_managed_task(tmp_path):
     assert len(managed) == 1
 
     gate.set()
+    await _await_managed(managed)
+    assert rag.process_calls == 1
+
+
+async def test_reprocess_selected_documents_report_runtime_identity(tmp_path):
+    """A selected retry returns existing runtime IDs before its async reset.
+
+    The Java scheduler must be able to monitor the old track rather than
+    uploading a second copy while the FAILED record still exists.
+    """
+    import asyncio
+    import importlib
+
+    doc_id = "doc-runtime-retry"
+    rag = _ScanRag(
+        {
+            doc_id: {
+                "status": DocStatus.FAILED,
+                "track_id": "track-runtime-retry",
+                "file_path": "contract.pdf",
+            }
+        }
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    gate = asyncio.Event()
+
+    async def _gated_process():
+        await gate.wait()
+        rag.process_calls += 1
+
+    rag.apipeline_process_enqueue_documents = _gated_process
+    router = create_document_routes(rag, doc_manager)
+    reprocess_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "reprocess_failed_documents"
+    ][-1]
+
+    managed: set = set()
+    response = await reprocess_endpoint(
+        managed,
+        _document_routes.ReprocessFailedRequest(doc_ids=[doc_id, "doc-missing"]),
+    )
+
+    assert response.documents == [
+        _document_routes.ReprocessDocumentRef(
+            doc_id=doc_id,
+            track_id="track-runtime-retry",
+            status=DocStatus.FAILED.value,
+        )
+    ]
+    assert response.missing_doc_ids == ["doc-missing"]
+    gate.set()
+    await _await_managed(managed)
+    assert rag.process_calls == 1
+
+
+async def test_reprocess_legacy_fallback_reports_selected_runtime_identity(tmp_path):
+    """The mocked/no-pipeline-status fallback preserves the same contract."""
+    doc_id = "doc-legacy-retry"
+    rag = _ScanRag(
+        {
+            doc_id: {
+                "status": DocStatus.FAILED,
+                "track_id": "track-legacy-retry",
+                "file_path": "legacy-contract.pdf",
+            }
+        }
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    router = create_document_routes(rag, doc_manager)
+    reprocess_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "reprocess_failed_documents"
+    ][-1]
+
+    managed: set = set()
+    response = await reprocess_endpoint(
+        managed,
+        _document_routes.ReprocessFailedRequest(doc_ids=[doc_id, "doc-missing"]),
+    )
+
+    assert [(item.doc_id, item.track_id) for item in response.documents] == [
+        (doc_id, "track-legacy-retry")
+    ]
+    assert response.missing_doc_ids == ["doc-missing"]
     await _await_managed(managed)
     assert rag.process_calls == 1
 

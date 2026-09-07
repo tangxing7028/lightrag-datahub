@@ -24,7 +24,12 @@ from fastapi import APIRouter
 from fastapi.testclient import TestClient
 
 # Fields that must NEVER appear in an unauthenticated response.
-_SENSITIVE_TOP_LEVEL = ("working_directory", "input_directory", "configuration")
+_SENSITIVE_TOP_LEVEL = (
+    "working_directory",
+    "input_directory",
+    "configuration",
+    "mineru_scheduling",
+)
 # Liveness fields that must always be present (safe; already exposed by the
 # unauthenticated /auth-status endpoint or pure liveness signals).
 _LIVENESS_FIELDS = ("status", "auth_mode", "core_version", "api_version")
@@ -240,6 +245,75 @@ def test_password_mode_valid_token_unlocks_config(monkeypatch):
 
     assert resp.status_code == 200
     _assert_full_config(resp.json())
+
+
+def test_authenticated_health_includes_sanitized_mineru_scheduling(monkeypatch):
+    import lightrag.api.utils_api as utils_api
+    from lightrag.parser.external.mineru import scheduling as mineru_scheduling
+
+    client = _build_client(monkeypatch)
+    _set_auth_mode(monkeypatch, auth_configured=True)
+    monkeypatch.setattr(
+        utils_api.auth_handler,
+        "validate_token",
+        lambda token: {"username": "admin", "role": "user"}
+        if token == "valid-user-token"
+        else (_ for _ in ()).throw(ValueError("bad token")),
+    )
+
+    async def safe_status():
+        return {
+            "enabled": True,
+            "global_capacity": 4,
+            "per_kb_capacity": 4,
+            "worker_count": 4,
+            "config_version": "config-v1",
+            "leases": {
+                "global_used_capacity": 2,
+                "active_leases": 1,
+                "recovery_leases": 0,
+                "waiters": 0,
+                "recovered_count": 0,
+            },
+        }
+
+    monkeypatch.setattr(mineru_scheduling, "mineru_scheduling_status", safe_status)
+
+    resp = client.get("/health", headers={"Authorization": "Bearer valid-user-token"})
+
+    assert resp.status_code == 200
+    status = resp.json()["mineru_scheduling"]
+    assert status["config_version"] == "config-v1"
+    assert status["leases"]["global_used_capacity"] == 2
+    assert "endpoint" not in str(status).lower()
+    assert "last_error" not in str(status).lower()
+
+
+def test_authenticated_health_stays_healthy_when_mineru_status_fails(monkeypatch):
+    import lightrag.api.utils_api as utils_api
+    from lightrag.parser.external.mineru import scheduling as mineru_scheduling
+
+    client = _build_client(monkeypatch)
+    _set_auth_mode(monkeypatch, auth_configured=True)
+    monkeypatch.setattr(
+        utils_api.auth_handler,
+        "validate_token",
+        lambda token: {"username": "admin", "role": "user"}
+        if token == "valid-user-token"
+        else (_ for _ in ()).throw(ValueError("bad token")),
+    )
+
+    async def unavailable_status():
+        raise RuntimeError("diagnostic store unavailable")
+
+    monkeypatch.setattr(
+        mineru_scheduling, "mineru_scheduling_status", unavailable_status
+    )
+
+    resp = client.get("/health", headers={"Authorization": "Bearer valid-user-token"})
+
+    assert resp.status_code == 200
+    assert resp.json()["mineru_scheduling"] == {"snapshot_available": False}
 
 
 def test_password_mode_guest_token_stays_liveness_only(monkeypatch):

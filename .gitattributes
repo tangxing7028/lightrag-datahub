@@ -1,2 +1,5 @@
 lightrag/api/webui/** binary
 lightrag/api/webui/** linguist-generated
+
+# The image executes this file directly through its POSIX shebang.
+docker-entrypoint.sh text eol=lf

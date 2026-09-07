@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import time
 from abc import abstractmethod
+from contextlib import asynccontextmanager
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -63,6 +64,7 @@ class ExternalParserBase(BaseParser):
         *,
         upload_name: str,
         engine_params: Mapping[str, Any] | None = None,
+        runtime_options: Mapping[str, Any] | None = None,
     ) -> None:
         """Fetch the raw bundle into ``raw_dir`` (called on cache miss only).
 
@@ -70,6 +72,24 @@ class ExternalParserBase(BaseParser):
         both the request payload and the recorded cache signature.
         """
         ...
+
+    @asynccontextmanager
+    async def acquire_remote_parse_lease(
+        self,
+        ctx: ParseContext,
+        source_path: Path,
+        *,
+        engine_params: Mapping[str, Any] | None = None,
+    ):
+        """Optionally reserve an external provider resource for a cache miss.
+
+        Most external parsers retain the historical no-op behavior. MinerU
+        overrides this at the actual request boundary so a shared weighted
+        lease covers only remote parsing, never sidecar construction or later
+        LightRAG indexing.
+        """
+        del ctx, source_path, engine_params
+        yield None
 
     @abstractmethod
     def build_ir(self, raw_dir: Path, document_name: str) -> "IRDoc":
@@ -146,12 +166,16 @@ class ExternalParserBase(BaseParser):
                 ctx.doc_id,
                 source.name,
             )
-            await self.download_into(
-                raw_dir,
-                source,
-                upload_name=rs.document_name,
-                engine_params=engine_params,
-            )
+            async with self.acquire_remote_parse_lease(
+                ctx, source, engine_params=engine_params
+            ) as runtime_options:
+                await self.download_into(
+                    raw_dir,
+                    source,
+                    upload_name=rs.document_name,
+                    engine_params=engine_params,
+                    runtime_options=runtime_options,
+                )
 
         ir = self.build_ir(raw_dir, rs.document_name)
         self.validate_ir(ir, file_path=ctx.file_path, raw_dir=raw_dir)
