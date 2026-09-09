@@ -18,7 +18,8 @@ import time
 import uuid
 import weakref
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -39,6 +40,12 @@ HEARTBEAT_SECONDS = 5.0
 DEFAULT_TIMEOUT_RECOVERY_TTL_SECONDS = 1200.0
 MAX_TIMEOUT_RECOVERY_TTL_SECONDS = 3600.0
 MEBIBYTE = 1024 * 1024
+_SERVICE_TOKEN_ERROR_ENV_KEYS = (
+    "AI_SERVICE_INTERNAL_TOKEN",
+    "DATAHUB_INTERNAL_SERVICE_TOKEN",
+    "INTERNAL_SERVICE_TOKEN",
+    "LIGHTRAG_API_KEY",
+)
 
 
 class MinerURequestTimeout(TimeoutError):
@@ -263,6 +270,9 @@ class _RuntimeConfigProvider:
         self._config = MinerUSchedulingConfig.defaults()
         self._expires_at = 0.0
         self._last_error = ""
+        self._last_refresh_at: str | None = None
+        self._last_success_at: str | None = None
+        self._has_remote_success = False
         self._guard = threading.RLock()
         self._loop_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = weakref.WeakKeyDictionary()
         self._loader: Optional[Callable[[], Any]] = None
@@ -283,18 +293,62 @@ class _RuntimeConfigProvider:
             with self._guard:
                 if now < self._expires_at:
                     return self._config
+            refresh_at = datetime.now(timezone.utc).isoformat()
             try:
                 loaded = await self._load()
+                if self._strict_required() and loaded.source != "ai-service":
+                    raise RuntimeError(
+                        "remote MinerU scheduling configuration is required but "
+                        "AI_SERVICE_URL is not configured"
+                    )
             except Exception as error:
                 with self._guard:
-                    self._last_error = str(error)
-                    self._expires_at = now + RUNTIME_CONFIG_CACHE_TTL_SECONDS
+                    self._last_refresh_at = refresh_at
+                    self._last_error = self._sanitize_error(error)
+                    if self._has_remote_success:
+                        self._expires_at = now + RUNTIME_CONFIG_CACHE_TTL_SECONDS
+                        self._config = replace(
+                            self._config, source="last-known-good"
+                        )
+                    elif self._strict_required():
+                        # Do not cache a strict first-load failure as a usable
+                        # fallback. Every subsequent readiness attempt must
+                        # retry the remote source or fail again.
+                        self._expires_at = 0.0
+                        raise RuntimeError(
+                            "initial remote MinerU scheduling configuration load failed"
+                        ) from error
+                    else:
+                        self._expires_at = now + RUNTIME_CONFIG_CACHE_TTL_SECONDS
                     return self._config
             with self._guard:
                 self._config = loaded
                 self._last_error = ""
+                self._last_refresh_at = refresh_at
+                if loaded.source == "ai-service":
+                    self._has_remote_success = True
+                    self._last_success_at = refresh_at
                 self._expires_at = now + RUNTIME_CONFIG_CACHE_TTL_SECONDS
                 return self._config
+
+    @staticmethod
+    def _strict_required() -> bool:
+        return os.getenv(
+            "RAG_SCHEDULING_REQUIRE_REMOTE_CONFIG", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _sanitize_error(error: BaseException) -> str:
+        message = " ".join(str(error).split())
+        # httpx errors can include a URL. Remove query/fragment portions so a
+        # badly configured endpoint cannot publish credentials in health data.
+        if "?" in message:
+            message = message.split("?", 1)[0]
+        for key in _SERVICE_TOKEN_ERROR_ENV_KEYS:
+            token = str(os.getenv(key) or "").strip()
+            if token:
+                message = message.replace(token, "[redacted]")
+        return message[:512]
 
     async def _load(self) -> MinerUSchedulingConfig:
         if self._loader is not None:
@@ -316,9 +370,14 @@ class _RuntimeConfigProvider:
             )
         prefix = os.getenv("AI_SERVICE_INTERNAL_PREFIX", "/ai/internal").strip("/")
         url = f"{base_url}/{prefix}/rag/config"
+        from lightrag.api.datahub_internal_auth import (
+            resolve_datahub_internal_service_headers,
+        )
+
+        headers = resolve_datahub_internal_service_headers(url)
         timeout = httpx.Timeout(5.0, connect=2.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(url, json={})
+            response = await client.post(url, json={}, headers=headers)
         response.raise_for_status()
         envelope = response.json()
         if not isinstance(envelope, Mapping) or envelope.get("code") != 200:
@@ -339,6 +398,8 @@ class _RuntimeConfigProvider:
                 "config_version": self._config.config_version,
                 "cache_ttl_seconds": max(0.0, self._expires_at - time.monotonic()),
                 "last_error": self._last_error,
+                "last_refresh_at": self._last_refresh_at,
+                "last_success_at": self._last_success_at,
             }
 
     def reset(self) -> None:
@@ -346,6 +407,9 @@ class _RuntimeConfigProvider:
             self._config = MinerUSchedulingConfig.defaults()
             self._expires_at = 0.0
             self._last_error = ""
+            self._last_refresh_at = None
+            self._last_success_at = None
+            self._has_remote_success = False
             self._loader = None
 
 
@@ -354,6 +418,11 @@ _runtime_config_provider = _RuntimeConfigProvider()
 
 async def get_mineru_runtime_config() -> MinerUSchedulingConfig:
     """Return the current validated scheduling snapshot."""
+    return await _runtime_config_provider.get()
+
+
+async def ensure_mineru_runtime_config_ready() -> MinerUSchedulingConfig:
+    """Prime configuration at startup and enforce strict first-load policy."""
     return await _runtime_config_provider.get()
 
 
@@ -438,7 +507,8 @@ class MinerUParseLease:
                     self._heartbeat_task = asyncio.create_task(self._heartbeat())
                     logger.info(
                         "[mineru-scheduling] admitted doc_id=%s workspace=%s size=%s weight=%s "
-                        "wait=%.3fs global=%s/%s kb=%s/%s requests=%s/%s config=%s",
+                        "wait=%.3fs global=%s/%s kb=%s/%s requests=%s/%s "
+                        "config=%s source=%s",
                         self.doc_id,
                         self.workspace,
                         self.file_size_bytes,
@@ -451,6 +521,7 @@ class MinerUParseLease:
                         admission.get("owner_active_requests", 0),
                         admission.get("owner_request_limit", 0),
                         config.config_version,
+                        config.source,
                     )
                     return self
                 await asyncio.sleep(
@@ -638,6 +709,9 @@ async def mineru_scheduling_status() -> dict[str, Any]:
             "source": provider_status["source"],
             "config_version": provider_status["config_version"],
             "cache_ttl_seconds": provider_status["cache_ttl_seconds"],
+            "last_refresh_at": provider_status["last_refresh_at"],
+            "last_success_at": provider_status["last_success_at"],
+            "last_error": provider_status["last_error"],
         },
         "snapshot_available": snapshot_available,
         "leases": leases,

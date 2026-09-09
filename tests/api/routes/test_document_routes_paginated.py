@@ -131,6 +131,7 @@ class _MetadataDocStatusStorage:
         doc = _doc(DocStatus.PROCESSED, "meta")
         doc.metadata = {
             "smartheading_llm_cache_ids": ["cache-1", "cache-2"],
+            "datahub_job_id": "101",
             "parse_engine": "native",
         }
         self.docs = {"meta-doc": doc}
@@ -167,6 +168,7 @@ def test_paginated_response_strips_internal_metadata_key():
     (doc,) = response.json()["documents"]
     assert doc["metadata"] == {"parse_engine": "native"}
     assert "smartheading_llm_cache_ids" not in doc["metadata"]
+    assert "datahub_job_id" not in doc["metadata"]
 
 
 def _doc_status_response(metadata):

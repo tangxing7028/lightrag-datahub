@@ -701,6 +701,7 @@ class _PipelineMixin:
         summary_options: dict | list[dict] | None = None,
         admission_token: str | None = None,
         from_scan: bool = False,
+        datahub_job_ids: str | list[str] | None = None,
     ) -> str:
         """
         Pipeline for Processing Documents
@@ -767,6 +768,9 @@ class _PipelineMixin:
                 by the process-stage summary hook; ``enable_summary=True`` is
                 additionally mirrored to ``doc_status.metadata`` so admin UIs
                 can surface it without a full_docs lookup.
+            datahub_job_ids: optional ai-service ingest-job identities. Values
+                are decimal strings and are persisted only as internal routing
+                metadata for terminal callbacks.
             admission_token: the pending-enqueue reservation the caller already
                 holds (endpoints reserve one before reading the request body).
                 With ``MAX_PENDING_DOCUMENTS > 0`` the admission guard
@@ -898,6 +902,8 @@ class _PipelineMixin:
             chunk_options = [chunk_options] * len(input)
         if isinstance(summary_options, dict):
             summary_options = [summary_options] * len(input)
+        if isinstance(datahub_job_ids, str):
+            datahub_job_ids = [datahub_job_ids] * len(input)
         # If file_paths is provided, ensure it matches the number of documents
         if file_paths is not None:
             if isinstance(file_paths, str):
@@ -937,6 +943,20 @@ class _PipelineMixin:
             raise ValueError(
                 "Number of summary_options dicts must match the number of documents"
             )
+        if datahub_job_ids is not None and len(datahub_job_ids) != len(input):
+            raise ValueError(
+                "Number of datahub_job_ids must match the number of documents"
+            )
+
+        def _datahub_job_id_at(index: int) -> str | None:
+            if datahub_job_ids is None:
+                return None
+            job_id = str(datahub_job_ids[index] or "").strip()
+            if not job_id.isdecimal() or len(job_id) > 20:
+                raise ValueError(
+                    "datahub_job_ids entries must be 1-20 digit decimal strings"
+                )
+            return job_id
 
         def _parse_engine_at(index: int, doc_format: str) -> str | None:
             if parse_engine is None:
@@ -1127,6 +1147,8 @@ class _PipelineMixin:
             # opted this document into summary generation.
             if summary_opts := _summary_options_at(index):
                 content_data["summary_options"] = summary_opts
+            if datahub_job_id := _datahub_job_id_at(index):
+                content_data["datahub_job_id"] = datahub_job_id
             contents[doc_id] = content_data
 
         # ``docs_format`` decides the ingestion path; ``ids`` only overrides
@@ -1202,6 +1224,8 @@ class _PipelineMixin:
                 # Same mirroring rationale as process_options; the process-stage
                 # summary hook reads the authoritative flag from full_docs.
                 metadata["enable_summary"] = True
+            if content_data.get("datahub_job_id"):
+                metadata["datahub_job_id"] = content_data["datahub_job_id"]
             source_file = _read_source_file(content_data)
             if source_file:
                 metadata["source_file"] = source_file
@@ -1527,6 +1551,10 @@ class _PipelineMixin:
                 if contents[doc_id].get("process_options"):
                     full_docs_data[doc_id]["process_options"] = contents[doc_id][
                         "process_options"
+                    ]
+                if contents[doc_id].get("datahub_job_id"):
+                    full_docs_data[doc_id]["datahub_job_id"] = contents[doc_id][
+                        "datahub_job_id"
                     ]
                 # ``chunk_options`` is always populated by ``_add_content``
                 # at enqueue time so it's persisted unconditionally.
@@ -5947,6 +5975,42 @@ class _PipelineMixin:
         if extra_fields:
             payload.update(extra_fields)
         await self.doc_status.upsert({doc_id: payload})
+        await self._notify_datahub_terminal(doc_id, status, payload)
+
+    async def _notify_datahub_terminal(
+        self,
+        doc_id: str,
+        status: DocStatus,
+        payload: dict[str, Any],
+    ) -> None:
+        """Enqueue a best-effort callback after the terminal upsert commits."""
+        if status not in {DocStatus.PROCESSED, DocStatus.FAILED}:
+            return
+        try:
+            from lightrag.api.datahub_ingest_callback import (
+                enqueue_datahub_terminal_callback,
+            )
+
+            await enqueue_datahub_terminal_callback(
+                doc_id=doc_id,
+                workspace=str(self.workspace or ""),
+                track_id=str(payload.get("track_id") or ""),
+                status=status,
+                updated_at=str(payload.get("updated_at") or ""),
+                metadata=payload.get("metadata"),
+                chunks_count=payload.get("chunks_count"),
+                error_msg=payload.get("error_msg"),
+            )
+        except Exception as callback_error:
+            # Notification is a latency optimisation. The persisted terminal
+            # status must never be rolled back or rewritten because of it.
+            logger.warning(
+                "Could not enqueue DataHub terminal callback doc_id=%s "
+                "workspace=%s error=%s",
+                doc_id,
+                self.workspace,
+                type(callback_error).__name__,
+            )
 
     async def _raise_if_cancelled(
         self,
@@ -6653,9 +6717,7 @@ class _PipelineMixin:
                 f"Original doc_id: {original_doc_id}, Status: {original_status}"
             )
 
-            await self.doc_status.upsert(
-                {
-                    doc_id: {
+            duplicate_payload = {
                         "status": DocStatus.FAILED,
                         "content_summary": (
                             f"[DUPLICATE:content_hash] Original document: "
@@ -6680,7 +6742,9 @@ class _PipelineMixin:
                             },
                         ),
                     }
-                }
+            await self.doc_status.upsert({doc_id: duplicate_payload})
+            await self._notify_datahub_terminal(
+                doc_id, DocStatus.FAILED, duplicate_payload
             )
         try:
             await self.full_docs.delete([doc_id])
