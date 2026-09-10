@@ -55,6 +55,9 @@ class TerminalNotification:
     updated_at: str
     chunks_count: int | None = None
     error_msg: str | None = None
+    parse_start_time: int | None = None
+    parse_end_time: int | None = None
+    parse_stage_skipped: bool | None = None
 
     @property
     def dedupe_key(self) -> tuple[str, str, str, str]:
@@ -70,6 +73,9 @@ class TerminalNotification:
             "runtime_updated_at": self.updated_at,
             "chunks_count": self.chunks_count,
             "error_msg": self.error_msg,
+            "parse_start_time": self.parse_start_time,
+            "parse_end_time": self.parse_end_time,
+            "parse_stage_skipped": self.parse_stage_skipped,
         }
 
 
@@ -332,6 +338,17 @@ async def enqueue_datahub_terminal_callback(
         and updated_at
     ):
         return False
+
+    def parse_epoch_seconds(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    persisted_metadata = metadata if isinstance(metadata, dict) else {}
     return await dispatcher.enqueue_terminal(
         TerminalNotification(
             job_id=job_id,
@@ -343,5 +360,16 @@ async def enqueue_datahub_terminal_callback(
             updated_at=str(updated_at),
             chunks_count=chunks_count,
             error_msg=error_msg,
+            parse_start_time=parse_epoch_seconds(
+                persisted_metadata.get("parse_start_time")
+            ),
+            parse_end_time=parse_epoch_seconds(
+                persisted_metadata.get("parse_end_time")
+            ),
+            parse_stage_skipped=(
+                True
+                if persisted_metadata.get("parse_stage_skipped") is True
+                else None
+            ),
         )
     )

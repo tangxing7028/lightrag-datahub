@@ -136,3 +136,48 @@ async def test_disabled_callback_does_not_enqueue():
     )
 
     assert await dispatcher.enqueue_terminal(_notification()) is False
+
+
+async def test_terminal_callback_carries_only_persisted_parse_timing(monkeypatch):
+    captured = []
+
+    class _Dispatcher:
+        enabled = True
+
+        async def enqueue_terminal(self, notification):
+            captured.append(notification)
+            return True
+
+    monkeypatch.setattr(callback, "_dispatcher", _Dispatcher())
+
+    accepted = await callback.enqueue_datahub_terminal_callback(
+        doc_id="201",
+        workspace="kb_301",
+        track_id="track-1",
+        status="processed",
+        updated_at="2026-09-09T10:00:00+00:00",
+        metadata={
+            "datahub_job_id": "101",
+            "parse_start_time": 1_789_010_520,
+            "parse_end_time": 1_789_010_585,
+            "private_runtime_detail": "must-not-be-forwarded",
+        },
+        chunks_count=7,
+        error_msg=None,
+    )
+
+    assert accepted is True
+    assert len(captured) == 1
+    assert captured[0].payload() == {
+        "doc_id": "201",
+        "kb_id": "301",
+        "workspace": "kb_301",
+        "track_id": "track-1",
+        "status": "processed",
+        "runtime_updated_at": "2026-09-09T10:00:00+00:00",
+        "chunks_count": 7,
+        "error_msg": None,
+        "parse_start_time": 1_789_010_520,
+        "parse_end_time": 1_789_010_585,
+        "parse_stage_skipped": None,
+    }

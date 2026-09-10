@@ -28,6 +28,12 @@ def _row(doc_id: str, status: DocStatus = DocStatus.PROCESSING) -> dict:
         "updated_at": "2026-09-09T10:00:00+00:00",
         "chunks_count": 3 if status == DocStatus.PROCESSED else 0,
         "error_msg": None,
+        "metadata": {
+            "parse_start_time": 1_789_010_520,
+            "parse_end_time": 1_789_010_585,
+            "parse_stage_skipped": False,
+            "internal_field": "must-not-leave-runtime",
+        },
     }
 
 
@@ -91,7 +97,32 @@ def test_batch_status_deduplicates_in_request_order_and_reports_missing():
         "updated_at",
         "chunks_count",
         "error_msg",
+        "parse_start_time",
+        "parse_end_time",
+        "parse_stage_skipped",
     }
+    assert response.json()["documents"][0]["parse_start_time"] == 1_789_010_520
+    assert response.json()["documents"][0]["parse_end_time"] == 1_789_010_585
+    assert response.json()["documents"][0]["parse_stage_skipped"] is None
+
+
+def test_batch_status_reports_a_parse_cache_hit_without_an_invented_end_time():
+    row = _row("2", DocStatus.PROCESSING)
+    row["metadata"] = {
+        "parse_start_time": 1_789_010_520,
+        "parse_stage_skipped": True,
+    }
+    response = _client(_Storage({"2": row})).post(
+        "/documents/status/batch",
+        headers=_headers(),
+        json={"doc_ids": ["2"]},
+    )
+
+    assert response.status_code == 200
+    document = response.json()["documents"][0]
+    assert document["parse_start_time"] == 1_789_010_520
+    assert document["parse_end_time"] is None
+    assert document["parse_stage_skipped"] is True
 
 
 def test_batch_status_accepts_200_ids_and_rejects_201():
