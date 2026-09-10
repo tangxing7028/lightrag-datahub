@@ -1602,6 +1602,9 @@ class BatchDocumentStatus(BaseModel):
     updated_at: Optional[str] = None
     chunks_count: Optional[int] = None
     error_msg: Optional[str] = None
+    parse_start_time: Optional[int] = None
+    parse_end_time: Optional[int] = None
+    parse_stage_skipped: Optional[bool] = None
 
 
 class BatchDocumentStatusRequest(BaseModel):
@@ -7262,6 +7265,16 @@ def create_document_routes(
 
         documents: list[BatchDocumentStatus] = []
         missing_doc_ids: list[str] = []
+
+        def parse_epoch_seconds(value: Any) -> int | None:
+            if isinstance(value, bool):
+                return None
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return None
+            return parsed if parsed > 0 else None
+
         for doc_id, row in zip(request.doc_ids, rows, strict=True):
             if row is None:
                 missing_doc_ids.append(doc_id)
@@ -7281,6 +7294,9 @@ def create_document_routes(
                     status_code=503,
                     detail="Document status storage returned an invalid status",
                 )
+            metadata = row.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
             documents.append(
                 BatchDocumentStatus(
                     doc_id=doc_id,
@@ -7289,6 +7305,15 @@ def create_document_routes(
                     updated_at=format_datetime(row.get("updated_at")),
                     chunks_count=row.get("chunks_count"),
                     error_msg=row.get("error_msg"),
+                    parse_start_time=parse_epoch_seconds(
+                        metadata.get("parse_start_time")
+                    ),
+                    parse_end_time=parse_epoch_seconds(
+                        metadata.get("parse_end_time")
+                    ),
+                    parse_stage_skipped=(
+                        True if metadata.get("parse_stage_skipped") is True else None
+                    ),
                 )
             )
         return BatchDocumentStatusResponse(
