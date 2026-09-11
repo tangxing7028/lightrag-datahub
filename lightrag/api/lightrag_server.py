@@ -1353,6 +1353,7 @@ def create_app(args):
         """Lifespan context manager for startup and shutdown events"""
         # Store background tasks
         app.state.background_tasks = set()
+        callback_started = False
 
         try:
             # Initialize database connections
@@ -1382,6 +1383,22 @@ def create_app(args):
                     "currently active"
                 )
 
+            # Prime MinerU scheduling before readiness. Strict deployments
+            # fail here when no remote configuration has ever been loaded;
+            # non-strict local deployments remain on the explicit fallback.
+            from lightrag.parser.external.mineru.scheduling import (
+                ensure_mineru_runtime_config_ready,
+            )
+
+            await ensure_mineru_runtime_config_ready()
+
+            from lightrag.api.datahub_ingest_callback import (
+                start_datahub_ingest_callback_dispatcher,
+            )
+
+            await start_datahub_ingest_callback_dispatcher()
+            callback_started = True
+
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
             yield
@@ -1394,6 +1411,13 @@ def create_app(args):
             shutdown_cancel = await drain_reserved_background_tasks(
                 app.state.background_tasks
             )
+
+            if callback_started:
+                from lightrag.api.datahub_ingest_callback import (
+                    stop_datahub_ingest_callback_dispatcher,
+                )
+
+                await stop_datahub_ingest_callback_dispatcher()
 
             # Clean up database connections
             await rag.finalize_storages()

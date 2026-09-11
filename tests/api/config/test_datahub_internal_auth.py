@@ -2,6 +2,7 @@
 
 from lightrag.api.datahub_internal_auth import (
     resolve_datahub_internal_openai_api_key,
+    resolve_datahub_internal_service_headers,
 )
 
 
@@ -64,3 +65,24 @@ def test_non_openai_binding_keeps_configured_key():
     )
 
     assert result == "provider-token"
+
+
+def test_internal_service_header_is_limited_to_exact_ai_service_origin_and_prefix():
+    environment = _environment(AI_SERVICE_INTERNAL_TOKEN="dedicated-token")
+
+    accepted = resolve_datahub_internal_service_headers(
+        "http://ai-service:8085/ai/internal/rag/config",
+        environ=environment,
+    )
+    external = resolve_datahub_internal_service_headers(
+        "https://provider.example/ai/internal/rag/config",
+        environ=environment,
+    )
+    prefix_lookalike = resolve_datahub_internal_service_headers(
+        "http://ai-service:8085/ai/internal-evil/rag/config",
+        environ=environment,
+    )
+
+    assert accepted == {"X-Internal-Service-Token": "dedicated-token"}
+    assert external == {}
+    assert prefix_lookalike == {}

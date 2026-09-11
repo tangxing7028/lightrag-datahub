@@ -40,6 +40,44 @@ def resolve_datahub_internal_openai_api_key(
     return configured_api_key
 
 
+def resolve_datahub_internal_service_headers(
+    target_url: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return the service token only for an ai-service internal endpoint.
+
+    Callers use this for runtime configuration and terminal callbacks.  The
+    exact-origin and internal-prefix checks keep the credential from following
+    an accidentally external ``AI_SERVICE_URL`` or a non-internal path.
+    """
+    values = os.environ if environ is None else environ
+    ai_service_url = str(values.get("AI_SERVICE_URL") or "").strip()
+    candidate_url = str(target_url or "").strip()
+    if not ai_service_url or not candidate_url:
+        return {}
+    try:
+        service = urlsplit(ai_service_url)
+        candidate = urlsplit(candidate_url)
+    except ValueError:
+        return {}
+    if not _same_origin(service, candidate):
+        return {}
+    prefix = str(values.get("AI_SERVICE_INTERNAL_PREFIX") or "/ai/internal")
+    normalized_prefix = "/" + prefix.strip().strip("/")
+    candidate_path = candidate.path.rstrip("/")
+    if not (
+        candidate_path == normalized_prefix
+        or candidate_path.startswith(normalized_prefix + "/")
+    ):
+        return {}
+    for key in _SERVICE_TOKEN_ENV_KEYS:
+        token = str(values.get(key) or "").strip()
+        if token:
+            return {"X-Internal-Service-Token": token}
+    return {}
+
+
 def _is_datahub_internal_openai_endpoint(
     binding: str | None,
     base_url: str | None,

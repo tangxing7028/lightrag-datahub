@@ -594,6 +594,7 @@ def upload_file_opener(input_dir: Path):
 # ids and ``doc-``-prefixed hashes both fit this rule.
 MAX_CUSTOM_DOC_ID_LENGTH = 128
 _CUSTOM_DOC_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_DATAHUB_JOB_ID_PATTERN = re.compile(r"^[0-9]{1,20}$")
 
 
 def validate_custom_doc_id(doc_id: str | None) -> str | None:
@@ -625,6 +626,19 @@ def validate_custom_doc_id(doc_id: str | None) -> str | None:
         raise HTTPException(
             status_code=400,
             detail="doc_id may only contain letters, digits, hyphens and underscores, and must start with a letter or digit",
+        )
+    return stripped
+
+
+def validate_datahub_job_id(job_id: str | None) -> str | None:
+    """Validate the opaque ai-service job identity carried by an upload."""
+    if not isinstance(job_id, str):
+        return None
+    stripped = job_id.strip()
+    if not _DATAHUB_JOB_ID_PATTERN.fullmatch(stripped):
+        raise HTTPException(
+            status_code=400,
+            detail="datahub_job_id must be a 1-20 digit decimal string",
         )
     return stripped
 
@@ -1409,7 +1423,9 @@ class DeleteDocRequest(BaseModel):
 # never reach the frontend. smartheading_llm_cache_ids is a deletion-time
 # LLM-cache purge list (written by the parse pipeline at pipeline.py:1748,
 # consumed only by adelete_by_doc_id).
-_INTERNAL_METADATA_KEYS = frozenset({"smartheading_llm_cache_ids"})
+_INTERNAL_METADATA_KEYS = frozenset(
+    {"smartheading_llm_cache_ids", "datahub_job_id"}
+)
 
 
 class DocStatusResponse(BaseModel):
@@ -1575,6 +1591,43 @@ class TrackStatusResponse(BaseModel):
             }
         }
     )
+
+
+class BatchDocumentStatus(BaseModel):
+    """Minimal status projection used by ai-service's observer."""
+
+    doc_id: str
+    track_id: Optional[str] = None
+    status: str
+    updated_at: Optional[str] = None
+    chunks_count: Optional[int] = None
+    error_msg: Optional[str] = None
+    parse_start_time: Optional[int] = None
+    parse_end_time: Optional[int] = None
+    parse_stage_skipped: Optional[bool] = None
+
+
+class BatchDocumentStatusRequest(BaseModel):
+    doc_ids: List[str] = Field(min_length=1, max_length=200)
+
+    @field_validator("doc_ids")
+    @classmethod
+    def validate_and_deduplicate_doc_ids(cls, doc_ids: List[str]) -> List[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for raw_doc_id in doc_ids:
+            doc_id = str(raw_doc_id or "").strip()
+            if not doc_id:
+                raise ValueError("Document ID cannot be empty")
+            if doc_id not in seen:
+                seen.add(doc_id)
+                ordered.append(doc_id)
+        return ordered
+
+
+class BatchDocumentStatusResponse(BaseModel):
+    documents: List[BatchDocumentStatus]
+    missing_doc_ids: List[str]
 
 
 class DocumentsRequest(BaseModel):
@@ -2783,6 +2836,7 @@ async def pipeline_enqueue_file(
     doc_id: str | None = None,
     chunking: "TextChunkingConfig | None" = None,
     summary_options: dict | None = None,
+    datahub_job_id: str | None = None,
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -2958,6 +3012,8 @@ async def pipeline_enqueue_file(
                 enqueue_kwargs["chunk_options"] = hint_chunk_options
             if summary_options is not None:
                 enqueue_kwargs["summary_options"] = summary_options
+            if datahub_job_id is not None:
+                enqueue_kwargs["datahub_job_ids"] = [datahub_job_id]
             enqueue_result = await rag.apipeline_enqueue_documents("", **enqueue_kwargs)
             if enqueue_result is None:
                 try:
@@ -3022,6 +3078,7 @@ async def pipeline_index_file(
     doc_id: str | None = None,
     chunking: "TextChunkingConfig | None" = None,
     summary_options: dict | None = None,
+    datahub_job_id: str | None = None,
 ):
     """Index a file with track_id
 
@@ -3048,6 +3105,7 @@ async def pipeline_index_file(
             doc_id=doc_id,
             chunking=chunking,
             summary_options=summary_options,
+            datahub_job_id=datahub_job_id,
         )
         if success:
             await rag.apipeline_process_enqueue_documents()
@@ -5598,6 +5656,7 @@ def create_document_routes(
         summary_model_config: Optional[str] = Form(None),
         http_request: Request = None,
         rag: LightRAG = resolve_request_rag,
+        datahub_job_id: Optional[str] = Form(None),
     ):
         """
         Upload a file to the input directory and index it.
@@ -5796,6 +5855,7 @@ def create_document_routes(
             # while leaving direct LightRAG uploads on the historical strict
             # filename-unique path.
             requested_doc_id = validate_custom_doc_id(doc_id)
+            requested_datahub_job_id = validate_datahub_job_id(datahub_job_id)
             storage_filename = _storage_filename_for_doc_id(
                 safe_filename, requested_doc_id
             )
@@ -5999,6 +6059,7 @@ def create_document_routes(
                         doc_id=requested_doc_id,
                         chunking=chunking_config,
                         summary_options=summary_options,
+                        datahub_job_id=requested_datahub_job_id,
                     )
                 finally:
                     await _release_enqueue_slot(rag, enqueue_token)
@@ -7161,6 +7222,104 @@ def create_document_routes(
             logger.error(f"Error getting track status for {track_id}: {str(e)}")
             logger.error(traceback.format_exc())
             raise internal_server_error(e)
+
+    @router.post(
+        "/status/batch",
+        response_model=BatchDocumentStatusResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_document_status_batch(
+        request: BatchDocumentStatusRequest,
+        rag: LightRAG = resolve_request_rag,
+    ) -> BatchDocumentStatusResponse:
+        """Return a bounded, workspace-scoped document status projection."""
+        try:
+            rows = await rag.doc_status.get_by_ids(request.doc_ids)
+        except Exception as storage_error:
+            logger.error(
+                "Document batch status storage unavailable workspace=%s count=%s "
+                "error=%s",
+                getattr(rag, "workspace", ""),
+                len(request.doc_ids),
+                type(storage_error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Document status storage is temporarily unavailable",
+            ) from storage_error
+
+        # First-party stores return one slot per requested id.  Reject a broken
+        # response rather than turning a partial backend failure into `missing`.
+        if not isinstance(rows, list) or len(rows) != len(request.doc_ids):
+            logger.error(
+                "Document batch status returned an invalid result workspace=%s "
+                "requested=%s returned=%s",
+                getattr(rag, "workspace", ""),
+                len(request.doc_ids),
+                len(rows) if isinstance(rows, list) else "non-list",
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Document status storage returned an incomplete result",
+            )
+
+        documents: list[BatchDocumentStatus] = []
+        missing_doc_ids: list[str] = []
+
+        def parse_epoch_seconds(value: Any) -> int | None:
+            if isinstance(value, bool):
+                return None
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return None
+            return parsed if parsed > 0 else None
+
+        for doc_id, row in zip(request.doc_ids, rows, strict=True):
+            if row is None:
+                missing_doc_ids.append(doc_id)
+                continue
+            if not isinstance(row, dict):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Document status storage returned an invalid row",
+                )
+            status = row.get("status")
+            if isinstance(status, DocStatus):
+                status = status.value
+            if str(status or "").strip().lower() not in {
+                item.value for item in DocStatus
+            }:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Document status storage returned an invalid status",
+                )
+            metadata = row.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            documents.append(
+                BatchDocumentStatus(
+                    doc_id=doc_id,
+                    track_id=row.get("track_id"),
+                    status=str(status).strip().lower(),
+                    updated_at=format_datetime(row.get("updated_at")),
+                    chunks_count=row.get("chunks_count"),
+                    error_msg=row.get("error_msg"),
+                    parse_start_time=parse_epoch_seconds(
+                        metadata.get("parse_start_time")
+                    ),
+                    parse_end_time=parse_epoch_seconds(
+                        metadata.get("parse_end_time")
+                    ),
+                    parse_stage_skipped=(
+                        True if metadata.get("parse_stage_skipped") is True else None
+                    ),
+                )
+            )
+        return BatchDocumentStatusResponse(
+            documents=documents,
+            missing_doc_ids=missing_doc_ids,
+        )
 
     @router.post(
         "/paginated",

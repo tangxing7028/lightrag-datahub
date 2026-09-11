@@ -88,8 +88,58 @@ async def test_runtime_provider_keeps_last_valid_snapshot_after_failure():
     provider._loader = failing_loader
     provider._expires_at = 0.0
     fallback = await provider.get()
-    assert fallback is first
+    assert fallback.config_version == first.config_version
+    assert fallback.global_capacity == first.global_capacity
+    assert fallback.source == "last-known-good"
     assert provider.status()["last_error"] == "temporary config outage"
+    assert provider.status()["last_success_at"] is not None
+
+
+async def test_runtime_provider_strict_initial_failure_is_fatal(monkeypatch):
+    provider = sched._RuntimeConfigProvider()
+    monkeypatch.setenv("RAG_SCHEDULING_REQUIRE_REMOTE_CONFIG", "true")
+    attempts = 0
+
+    async def failing_loader():
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("initial outage")
+
+    provider._loader = failing_loader
+
+    with pytest.raises(
+        RuntimeError,
+        match="initial remote MinerU scheduling configuration load failed",
+    ):
+        await provider.get()
+
+    with pytest.raises(
+        RuntimeError,
+        match="initial remote MinerU scheduling configuration load failed",
+    ):
+        await provider.get()
+
+    assert provider.status()["source"] == "fallback"
+    assert provider.status()["last_error"] == "initial outage"
+    assert provider.status()["last_success_at"] is None
+    assert attempts == 2
+
+
+async def test_runtime_provider_sanitizes_query_and_service_token(monkeypatch):
+    provider = sched._RuntimeConfigProvider()
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "sensitive-token")
+
+    async def failing_loader():
+        raise RuntimeError(
+            "request to http://ai-service/rag/config?token=sensitive-token failed"
+        )
+
+    provider._loader = failing_loader
+    await provider.get()
+
+    error = provider.status()["last_error"]
+    assert error == "request to http://ai-service/rag/config"
+    assert "sensitive-token" not in error
 
 
 async def test_lease_persists_task_id_and_releases_a_confirmed_terminal_timeout(
@@ -301,7 +351,9 @@ async def test_status_does_not_disclose_the_mineru_endpoint():
 
     assert status["config_version"] == "status-v1"
     assert "mineru.internal" not in str(status)
-    assert "last_error" not in status["runtime_config"]
+    assert status["runtime_config"]["last_error"] == ""
+    assert status["runtime_config"]["last_refresh_at"] is not None
+    assert status["runtime_config"]["last_success_at"] is not None
 
 
 def test_pipeline_keeps_a_bounded_pool_for_pending_mineru_admission():

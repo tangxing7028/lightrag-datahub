@@ -373,6 +373,10 @@ def test_carry_over_keys_grouped_by_stage():
     assert _DOC_STATUS_METADATA_CARRY_OVER_KEYS == (
         "process_options",
         "source_file",
+        # Opaque ai-service ingest identity follows the document through every
+        # pipeline stage so a persisted terminal state can be routed back to
+        # the exact ingest job.
+        "datahub_job_id",
         # DataHub fork: upload-time summary opt-in — a directive like
         # process_options, grouped with it ahead of the stage fields.
         "enable_summary",

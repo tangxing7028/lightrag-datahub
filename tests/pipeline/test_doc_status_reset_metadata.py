@@ -123,6 +123,22 @@ def test_reset_metadata_keeps_directives_drops_attempt_fields():
     assert result == {"process_options": "iF", "source_file": "report.pdf"}
 
 
+def test_datahub_job_id_survives_status_transitions_and_retry_reset():
+    status_doc = {
+        "metadata": {
+            "datahub_job_id": "2097177109362921473",
+            "parse_end_time": 200,
+        }
+    }
+
+    assert doc_status_transition_metadata(status_doc)["datahub_job_id"] == (
+        "2097177109362921473"
+    )
+    assert doc_status_reset_metadata(status_doc) == {
+        "datahub_job_id": "2097177109362921473"
+    }
+
+
 def test_reset_metadata_normalizes_legacy_source_file_name():
     result = doc_status_reset_metadata(
         {"metadata": {"source_file_name": "legacy.docx", "process_options": "t"}}
