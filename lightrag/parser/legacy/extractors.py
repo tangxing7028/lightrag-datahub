@@ -177,10 +177,10 @@ _BINARY_EXTRACTORS = {
 _ZIP_OFFICE_SUFFIXES = frozenset({"docx", "pptx", "xlsx"})
 
 
-def _decode_text(file_bytes: bytes) -> str:
+def _decode_text(file_bytes: bytes, *, encoding: str = "utf-8") -> str:
     """UTF-8 decode with the upload-path validation, raised on failure."""
     try:
-        content = file_bytes.decode("utf-8")
+        content = file_bytes.decode(encoding)
     except UnicodeDecodeError as e:
         raise LegacyExtractionError(
             "File is not valid UTF-8 encoded text. Please convert it to "
@@ -230,4 +230,4 @@ def extract_text(
         return _extract_pdf_pypdf(file_bytes, pdf_password)
     if extractor is not None:
         return extractor(file_bytes)
-    return _decode_text(file_bytes)
+    return _decode_text(file_bytes, encoding="utf-8-sig" if suffix == "md" else "utf-8")
