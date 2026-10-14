@@ -49,18 +49,35 @@ def test_md_is_supported_file(doc_manager, monkeypatch):
     assert doc_manager.is_supported_file("doc.md") is True
 
 
-def test_external_parser_contract_falls_back_for_markdown():
-    """A MinerU knowledge-base contract must not produce an invalid MD hint."""
+@pytest.mark.parametrize("parser", ["mineru", "docling", "native", "legacy"])
+@pytest.mark.parametrize("suffix", ["md", "MD"])
+def test_markdown_contract_reads_text_directly(parser, suffix):
+    """Markdown already is extracted content, regardless of the KB parser."""
     hinted = upload_filename_with_directives(
-        "notes.md",
-        parser="mineru",
+        f"notes.{suffix}",
+        parser=parser,
         parse_method="auto",
         enable_image="true",
         enable_table="true",
         enable_equation="true",
         skip_entity_extract="false",
     )
-    assert hinted == "notes.[native-ite].md"
+    assert hinted == f"notes.[legacy-ite].{suffix}"
+    assert resolve_file_parser_engine(hinted) == "legacy"
+
+
+def test_markdown_preserves_processing_flags_without_ocr(monkeypatch):
+    monkeypatch.setenv("MINERU_ADDITIONAL_SUFFIXES", "md")
+    hinted = upload_filename_with_directives(
+        "notes.md",
+        parser="mineru",
+        parse_method="ocr",
+        enable_image="false",
+        enable_table="true",
+        enable_equation="false",
+        skip_entity_extract="true",
+    )
+    assert hinted == "notes.[legacy-t!].md"
 
 
 def test_supported_external_suffix_keeps_selected_parser():

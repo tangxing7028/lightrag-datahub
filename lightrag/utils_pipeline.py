@@ -46,6 +46,7 @@ from lightrag.parser.routing import (
 )
 from lightrag.utils import (
     compute_mdhash_id,
+    ENTITY_EXTRACTION_DEGRADATION_METADATA_KEY,
     get_content_summary,
     LLM_TRUNCATION_METADATA_KEY,
     logger,
@@ -312,7 +313,8 @@ def read_source_file_basename(data: Any) -> str | None:
 # attempted but bailed".
 # ``parse_stage_skipped`` is written by ``parse_mineru`` / ``parse_docling``
 # when the raw bundle cache is valid and the parse stage round trip is
-# skipped; absence == not skipped (e.g. native parser, or cache miss).
+# skipped, or by ``LegacyParser`` for a direct Markdown text read. Absence
+# means parsing was not skipped (e.g. native parser, or cache miss).
 # ``analyzing_stage_skipped`` is its analyze-stage counterpart, written by
 # ``analyze_multimodal``'s three user/config early-return branches (no
 # blocks_path, blocks file missing, or user opted out of every i/t/e
@@ -364,6 +366,8 @@ KG_RECOVERY_WARNINGS_METADATA_KEY = "kg_recovery_warnings"
 _DOC_STATUS_METADATA_CARRY_OVER_KEYS: tuple[str, ...] = (
     "process_options",
     "source_file",
+    # Opaque ai-service ingest identity used only for terminal callbacks.
+    "datahub_job_id",
     # DataHub fork: upload-time summary opt-in (mirrors the authoritative
     # full_docs.summary_options); must survive every stage transition so a
     # retried document still gets its summary.
@@ -590,6 +594,7 @@ def doc_status_transition_metadata(
 _DOC_STATUS_METADATA_DIRECTIVE_KEYS: tuple[str, ...] = (
     "process_options",
     "source_file",
+    "datahub_job_id",
     # DataHub fork: the upload-time summary opt-in rides every reset exactly
     # like process_options — the retry must regenerate the summary too.
     "enable_summary",
@@ -647,6 +652,9 @@ _DOC_STATUS_METADATA_ATTEMPT_KEYS: frozenset[str] = frozenset(
         # output budget must start from a clean slate, and the terminal
         # transition rewrites the key only when the new attempt truncated too.
         LLM_TRUNCATION_METADATA_KEY,
+        # Recoverable-but-degraded entity extraction is attempt-scoped too: a
+        # clean retry must not keep advertising a prior empty model response.
+        ENTITY_EXTRACTION_DEGRADATION_METADATA_KEY,
     }
 )
 

@@ -79,4 +79,5 @@ class LegacyParser(BaseParser):
             content=text,
             blocks_path="",
             parse_engine=self.engine_name,
+            parse_stage_skipped=suffix == "md",
         )

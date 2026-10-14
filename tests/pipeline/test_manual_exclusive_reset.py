@@ -28,6 +28,7 @@ from lightrag.kg.shared_storage import (
     get_pipeline_ingress,
     make_owner_record,
 )
+from lightrag.kg.pipeline_ingress import PipelineIngressMessage
 from lightrag.utils import EmbeddingFunc, Tokenizer, compute_mdhash_id
 
 from .conftest import request_failed_retry
@@ -156,6 +157,39 @@ def test_refail_during_process_stays_failed(tmp_path):
             # A second run with no new signal must not retry again.
             await rag.apipeline_process_enqueue_documents()
             assert extract.calls == calls_after_failure + 1
+        finally:
+            await rag.finalize_storages()
+
+    asyncio.run(_run())
+
+
+def test_selected_manual_retry_resets_only_requested_failed_documents(tmp_path):
+    """A targeted retry must not reset unrelated FAILED records in the KB."""
+
+    async def _run():
+        extract = _CountingExtract()
+        rag = await _build_rag(tmp_path, extract)
+        try:
+            id_a = await _make_failed(rag, "selected.txt", extract)
+            id_b = await _make_failed(rag, "untouched.txt", extract)
+            extract.fail = False
+
+            ingress = await get_pipeline_ingress(rag.workspace)
+            request_id = uuid4().hex
+            ingress.request_manual_retry(
+                request_id,
+                PipelineIngressMessage(
+                    kind="rescan",
+                    retry_failed=True,
+                    request_id=request_id,
+                    doc_ids=(id_a,),
+                ),
+            )
+            await rag.apipeline_process_enqueue_documents()
+
+            assert await _status_of(rag, id_a) == DocStatus.PROCESSED.value
+            assert await _status_of(rag, id_b) == DocStatus.FAILED.value
+            assert ingress.snapshot_manual_retries() == []
         finally:
             await rag.finalize_storages()
 

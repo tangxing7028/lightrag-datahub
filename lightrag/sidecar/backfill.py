@@ -40,6 +40,7 @@ content, so a span covering them maps to the right block(s) unchanged.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,17 @@ _ARTIFACT_REWRITE_MARKERS = (
     ".blocks.assets/",
 )
 
+# MinerU can emit an empty HTML image tag, and chunking can retain only its
+# tail (for example ``30491380614b8.jpg\" src=\"\" />``). It has no recoverable
+# source-block provenance. Keep this narrow so ordinary unmatched HTML still
+# fails closed instead of being attributed to the wrong block.
+_EMPTY_HTML_IMAGE_FRAGMENT_RE = re.compile(
+    r"(?:<img\b[^>]*\bsrc\s*=\s*[\"']\s*[\"'][^>]*>"
+    r"|(?:^|\s)[^\s<>\"']+\.(?:avif|bmp|gif|jpe?g|png|svg|webp)\"\s+"
+    r"src\s*=\s*[\"']\s*[\"']\s*/?>)",
+    re.IGNORECASE,
+)
+
 
 def _contains_rewritten_artifact(body: str) -> bool:
     """True when a chunk carries a rewritten artifact URL/path marker.
@@ -108,6 +120,11 @@ def _contains_rewritten_artifact(body: str) -> bool:
     ambiguous text chunk.
     """
     return any(marker in (body or "") for marker in _ARTIFACT_REWRITE_MARKERS)
+
+
+def _contains_empty_html_image_fragment(body: str) -> bool:
+    """True for MinerU's empty HTML image placeholder or its truncated tail."""
+    return bool(_EMPTY_HTML_IMAGE_FRAGMENT_RE.search(body or ""))
 
 
 def _load_content_blocks(blocks_path: str) -> list[tuple[str, str]]:
@@ -277,7 +294,11 @@ def backfill_chunk_sidecars(
                     "split; skipping provenance for it"
                 )
                 continue
-            if _contains_markdown_image(body) or _contains_rewritten_artifact(body):
+            if (
+                _contains_markdown_image(body)
+                or _contains_rewritten_artifact(body)
+                or _contains_empty_html_image_fragment(body)
+            ):
                 # Artifact URL rewriting replaces parser drawing paths in the
                 # chunk source after blocks.jsonl is written, so image/table-bearing
                 # chunks (markdown image syntax or rewritten artifact URL/path

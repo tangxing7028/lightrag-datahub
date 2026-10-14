@@ -342,6 +342,18 @@ def test_image_chunk_without_matchable_span_skips_sidecar_not_fails(
 
     assert "sidecar" not in chunks[0]
 
+
+@pytest.mark.offline
+def test_empty_html_image_fragment_skips_sidecar_not_fails(tmp_path: Path) -> None:
+    # MinerU can leave only the tail of an empty HTML image placeholder after
+    # chunking. It has no source span but must not fail the whole document.
+    blocks_path = _write_blocks(tmp_path, [("b1", "Plain text without images.")])
+    chunks = [_chunk('30491380614b8.jpg" src="" />', 6)]
+
+    backfill_chunk_sidecars(chunks, blocks_path)
+
+    assert "sidecar" not in chunks[0]
+
 @pytest.mark.offline
 def test_rewritten_artifact_marker_chunk_skips_sidecar_not_fails(tmp_path: Path) -> None:
     # Regression: DocumentHub artifact URL rewriting replaces parser image/table

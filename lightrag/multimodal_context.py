@@ -78,6 +78,7 @@ from lightrag.table_markup import (
     detect_table_format,
     parse_table_tag,
     serialize_html_rows,
+    serialize_table_tag,
     split_html_rows,
 )
 from lightrag.utils import Tokenizer
@@ -282,7 +283,7 @@ def _row_trim_table_leading(
     match = TABLE_TAG_RE.match(tag_text.strip())
     if not match:
         return None
-    attrs = match.group("attrs")
+    attrs = match.group("attrs") or ""
     body = match.group("body")
     fmt = detect_table_format(attrs, body)
     if fmt == "json":
@@ -291,10 +292,8 @@ def _row_trim_table_leading(
             return None
         attrs_str, rows = parsed
         for k in range(len(rows) - 1, 0, -1):
-            candidate = (
-                f"<table {attrs_str}>"
-                f"{json.dumps(rows[-k:], ensure_ascii=False)}"
-                f"</table>"
+            candidate = serialize_table_tag(
+                attrs_str, json.dumps(rows[-k:], ensure_ascii=False)
             )
             if _count_tokens(tokenizer, candidate) <= max_tokens:
                 return candidate
@@ -311,7 +310,7 @@ def _row_trim_table_leading(
             return None
         for k in range(len(rows) - 1, 0, -1):
             inner = serialize_html_rows(rows[-k:])
-            candidate = f"<table {attrs}>{inner}</table>"
+            candidate = serialize_table_tag(attrs, inner)
             if _count_tokens(tokenizer, candidate) <= max_tokens:
                 return candidate
         return _char_fallback_html_table(
@@ -331,7 +330,7 @@ def _row_trim_table_trailing(
     match = TABLE_TAG_RE.match(tag_text.strip())
     if not match:
         return None
-    attrs = match.group("attrs")
+    attrs = match.group("attrs") or ""
     body = match.group("body")
     fmt = detect_table_format(attrs, body)
     if fmt == "json":
@@ -340,8 +339,8 @@ def _row_trim_table_trailing(
             return None
         attrs_str, rows = parsed
         for k in range(len(rows) - 1, 0, -1):
-            candidate = (
-                f"<table {attrs_str}>{json.dumps(rows[:k], ensure_ascii=False)}</table>"
+            candidate = serialize_table_tag(
+                attrs_str, json.dumps(rows[:k], ensure_ascii=False)
             )
             if _count_tokens(tokenizer, candidate) <= max_tokens:
                 return candidate
@@ -358,7 +357,7 @@ def _row_trim_table_trailing(
             return None
         for k in range(len(rows) - 1, 0, -1):
             inner = serialize_html_rows(rows[:k])
-            candidate = f"<table {attrs}>{inner}</table>"
+            candidate = serialize_table_tag(attrs, inner)
             if _count_tokens(tokenizer, candidate) <= max_tokens:
                 return candidate
         return _char_fallback_html_table(
@@ -372,7 +371,7 @@ def _row_trim_table_trailing(
 
 
 def _empty_table(attrs: str) -> str:
-    return f"<table {attrs}></table>"
+    return serialize_table_tag(attrs, "")
 
 
 def _char_fallback_json_table(
@@ -398,7 +397,7 @@ def _char_fallback_json_table(
         if not chars:
             return empty
         body = json.dumps([[snippet]], ensure_ascii=False)
-        return f"<table {attrs}>{body}</table>"
+        return serialize_table_tag(attrs, body)
 
     if _count_tokens(tokenizer, candidate(len(source_text))) <= max_tokens:
         return candidate(len(source_text))
@@ -432,7 +431,7 @@ def _char_fallback_html_table(
         snippet = text[-chars:] if keep_tail and chars else text[:chars]
         if not chars:
             return empty
-        return f"<table {attrs}><tr><td>{html_escape(snippet)}</td></tr></table>"
+        return serialize_table_tag(attrs, f"<tr><td>{html_escape(snippet)}</td></tr>")
 
     if _count_tokens(tokenizer, candidate(len(text))) <= max_tokens:
         return candidate(len(text))

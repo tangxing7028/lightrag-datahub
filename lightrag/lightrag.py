@@ -78,6 +78,7 @@ from lightrag.constants import (
     DEFAULT_MAX_PARALLEL_ANALYZE,
     DEFAULT_MAX_PARALLEL_PARSE_NATIVE,
     DEFAULT_MAX_PARALLEL_PARSE_MINERU,
+    DEFAULT_MAX_PENDING_MINERU_ADMISSIONS,
     DEFAULT_MAX_PARALLEL_PARSE_DOCLING,
     DEFAULT_QUEUE_SIZE_PARSE,
     DEFAULT_QUEUE_SIZE_ANALYZE,
@@ -188,6 +189,7 @@ from lightrag.utils import (
     normalize_string_list,
     run_in_chunking_executor,
     TokenLimitTruncationTally,
+    EntityExtractionDegradationTally,
     LLM_TRUNCATION_METADATA_KEY,
     merge_truncation_metadata,
 )
@@ -810,6 +812,13 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     max_parallel_parse_mineru: int = field(
         default=get_env_value(
             "MAX_PARALLEL_PARSE_MINERU", DEFAULT_MAX_PARALLEL_PARSE_MINERU, int
+        )
+    )
+    max_pending_mineru_admissions: int = field(
+        default=get_env_value(
+            "MAX_PENDING_MINERU_ADMISSIONS",
+            DEFAULT_MAX_PENDING_MINERU_ADMISSIONS,
+            int,
         )
     )
     max_parallel_parse_docling: int = field(
@@ -2990,8 +2999,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 await self._delete_doc_summary(doc_id)
             except Exception as summary_delete_error:
                 logger.warning(
-                    "Failed to delete doc summary while rolling back document "
-                    "%s: %s",
+                    "Failed to delete doc summary while rolling back document %s: %s",
                     doc_id,
                     summary_delete_error,
                 )
@@ -3248,6 +3256,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         pipeline_status=None,
         pipeline_status_lock=None,
         truncation_tally: TokenLimitTruncationTally | None = None,
+        degradation_tally: EntityExtractionDegradationTally | None = None,
     ) -> list:
         try:
             chunk_results = await extract_entities(
@@ -3258,6 +3267,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 llm_response_cache=self.llm_response_cache,
                 text_chunks_storage=self.text_chunks,
                 truncation_tally=truncation_tally,
+                degradation_tally=degradation_tally,
             )
             return chunk_results
         except Exception as e:

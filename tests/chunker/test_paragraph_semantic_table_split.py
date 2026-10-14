@@ -16,6 +16,7 @@ from lightrag.chunker.paragraph_semantic import (
     _split_table_text,
     chunking_by_paragraph_semantic,
 )
+from lightrag.table_markup import TABLE_TAG_RE
 from lightrag.utils import Tokenizer, TokenizerInterface
 
 
@@ -407,6 +408,41 @@ def test_detect_table_format_sniff_when_attrs_silent():
     assert _detect_table_format("", "<tr><td>x</td></tr>") == "html"
     # Body that doesn't look like JSON or HTML → unknown.
     assert _detect_table_format("", "plain text rows") is None
+
+
+@pytest.mark.offline
+def test_public_chunking_splits_bare_mineru_html_table_at_row_boundaries(tmp_path):
+    """MinerU may emit a bare ``<table>`` rather than ``<table …>``.
+
+    The table must still use TableRowSplit. A character fallback could cut a
+    ``colspan`` attribute in half, which was the production regression.
+    """
+    tokenizer = _make_tokenizer()
+    body = "<table>" + "".join(
+        f'<tr><td colspan="3">row-{index}-{"x" * 220}</td></tr>'
+        for index in range(5)
+    ) + "</table>"
+    blocks_path = _write_blocks_jsonl(tmp_path, body)
+
+    chunks = chunking_by_paragraph_semantic(
+        tokenizer,
+        body,
+        chunk_token_size=1000,
+        blocks_path=blocks_path,
+        chunk_overlap_token_size=0,
+    )
+
+    table_chunks = [
+        chunk["content"] for chunk in chunks if "<table" in chunk["content"]
+    ]
+    assert len(table_chunks) >= 2
+    assert all(TABLE_TAG_RE.fullmatch(chunk) for chunk in table_chunks)
+    assert all(chunk.startswith("<table>") for chunk in table_chunks)
+    assert all('colspan="3"' in chunk for chunk in table_chunks)
+    assert all(
+        chunk.count('<td colspan="3">') == chunk.count("</td>")
+        for chunk in table_chunks
+    )
 
 
 @pytest.mark.offline

@@ -23,6 +23,7 @@ import pytest
 
 from lightrag.parser.external.mineru import is_bundle_valid
 from lightrag.parser.external.mineru.client import MinerURawClient
+from lightrag.parser.external.mineru.scheduling import MinerURequestTimeout
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +165,84 @@ async def test_wrapper_uses_configured_http_timeout(
 
     assert seen["args"] == (480.0,)
     assert seen["kwargs"] == {"connect": 12.0}
+
+
+@pytest.mark.offline
+async def test_runtime_options_override_endpoint_timeouts_and_report_task_id(
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://env.example:8000")
+    observed: list[str] = []
+
+    async def on_remote_task(task_id: str) -> None:
+        observed.append(task_id)
+
+    client = MinerURawClient(
+        runtime_options={
+            "mineru_base_url": "http://config.example:9014",
+            "connect_timeout_seconds": 17,
+            "read_timeout_seconds": 777,
+            "poll_interval_seconds": 3,
+            "poll_max_attempts": 123,
+            "on_remote_task": on_remote_task,
+        }
+    )
+
+    assert client.local_endpoint == "http://config.example:9014"
+    assert client.connect_timeout_seconds == 17
+    assert client.http_timeout_seconds == 777
+    assert client.poll_interval == 3
+    assert client.max_polls == 123
+    await client._record_remote_task("local-task-9")
+    assert observed == ["local-task-9"]
+
+
+@pytest.mark.offline
+async def test_timeout_probes_local_task_and_marks_terminal_result(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeTimeout(Exception):
+        pass
+
+    fake_httpx.TimeoutException = _FakeTimeout
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://127.0.0.1:8000")
+
+    class _TimeoutThenTerminalDispatcher(_Dispatcher):
+        def __init__(self) -> None:
+            self.poll_attempts = 0
+
+        def post(self, url: str, **_: Any) -> _FakeResponse:
+            assert url == "http://127.0.0.1:8000/tasks"
+            return _FakeResponse(text=json.dumps({"task_id": "terminal-7"}))
+
+        def get(self, url: str, **_: Any) -> _FakeResponse:
+            assert url == "http://127.0.0.1:8000/tasks/terminal-7"
+            self.poll_attempts += 1
+            if self.poll_attempts == 1:
+                raise _FakeTimeout("read timed out")
+            return _FakeResponse(text=json.dumps({"status": "completed"}))
+
+    source = tmp_path / "timeout.pdf"
+    source.write_bytes(b"PDF")
+    raw = tmp_path / "timeout.mineru_raw"
+    raw.mkdir()
+    dispatcher = _TimeoutThenTerminalDispatcher()
+    _CURRENT.dispatcher = dispatcher
+
+    with pytest.raises(MinerURequestTimeout) as exc_info:
+        await MinerURawClient().download_into(raw, source)
+
+    error = exc_info.value
+    assert error.remote_task_id == "terminal-7"
+    assert error.timeout_kind == "poll"
+    assert error.remote_task_terminal is True
+    assert error.remote_task_state == "completed"
+    assert dispatcher.poll_attempts == 2
 
 
 # ---------------------------------------------------------------------------

@@ -3334,6 +3334,8 @@ async def commit_manual_retry_request(
     ingress,
     request_id: str,
     state: Dict[str, Any],
+    *,
+    doc_ids: tuple[str, ...] = (),
 ) -> Optional[str]:
     """Fence recheck + sticky manual-retry publish in ONE critical section.
 
@@ -3356,7 +3358,10 @@ async def commit_manual_retry_request(
     Returns ``None`` on success, or the human-readable refusal message.
     """
     message = PipelineIngressMessage(
-        kind="rescan", retry_failed=True, request_id=request_id
+        kind="rescan",
+        retry_failed=True,
+        request_id=request_id,
+        doc_ids=doc_ids,
     )
     async with pipeline_status_lock:
         snapshot, recovery_updates = _prepare_pipeline_reservation_decision(
@@ -4391,6 +4396,574 @@ async def global_concurrency_in_use(group: str) -> int:
     """
     ns = await _get_lease_namespace()
     return len(_load_gate_state(ns, group)["leases"])
+
+
+# ---------------------------------------------------------------------------
+# Weighted cross-worker leases (MinerU document parsing)
+# ---------------------------------------------------------------------------
+#
+# The generic slots above count one provider call per lease. MinerU document
+# parsing needs a richer account: a large document can consume several units
+# and each LightRAG workspace has its own ceiling. Keep this state in the same
+# manager-backed namespace, but under a separate group key, so the existing
+# LLM/embedding/rerank gates remain byte-for-byte compatible.
+#
+# State shape::
+#
+#     ns[group] = {
+#         "leases": {
+#             lease_id: {
+#                 "pid", "updated_at", "acquired_at", "weight", "kb_key",
+#                 "owner_id", "owner_request_limit", "state",
+#                 "config_version", "file_size_bytes", ...
+#             },
+#         },
+#         "waiters": {
+#             waiter_id: {
+#                 "pid", "wait_start", "last_poll", "weight", "kb_key",
+#                 "owner_id", "owner_request_limit",
+#             },
+#         },
+#         "recovered_count": int,
+#     }
+#
+# The caller supplies current capacities at each acquire attempt. This is
+# deliberate: an administrator can lower or raise capacity without restarting
+# Gunicorn, while leases already admitted retain their recorded weight.
+
+DEFAULT_WEIGHTED_LEASE_AGING_SECONDS = 30.0
+
+
+def _empty_weighted_gate_state() -> Dict[str, Any]:
+    return {"leases": {}, "waiters": {}, "recovered_count": 0}
+
+
+def _load_weighted_gate_state(ns: Dict[str, Any], group: str) -> Dict[str, Any]:
+    """Read one independently mutable weighted gate state copy."""
+    raw = ns.get(group)
+    if raw is None:
+        return _empty_weighted_gate_state()
+    state = dict(raw)
+    state["leases"] = {
+        lease_id: dict(lease)
+        for lease_id, lease in dict(state.get("leases") or {}).items()
+    }
+    state["waiters"] = {
+        waiter_id: dict(waiter)
+        for waiter_id, waiter in dict(state.get("waiters") or {}).items()
+    }
+    try:
+        state["recovered_count"] = max(0, int(state.get("recovered_count") or 0))
+    except (TypeError, ValueError):
+        state["recovered_count"] = 0
+    return state
+
+
+def _weighted_lease_weight(lease: Mapping[str, Any]) -> int:
+    try:
+        return max(0, int(lease.get("weight") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _weighted_usage(state: Mapping[str, Any]) -> tuple[int, Dict[str, int]]:
+    """Return total and per-KB capacity held by the supplied live state."""
+    global_used = 0
+    by_kb: Dict[str, int] = {}
+    for lease in dict(state.get("leases") or {}).values():
+        weight = _weighted_lease_weight(lease)
+        if weight <= 0:
+            continue
+        global_used += weight
+        kb_key = str(lease.get("kb_key") or "")
+        by_kb[kb_key] = by_kb.get(kb_key, 0) + weight
+    return global_used, by_kb
+
+
+def _weighted_owner_request_counts(state: Mapping[str, Any]) -> Dict[str, int]:
+    """Return active remote-request counts, including recovery leases, by owner."""
+    by_owner: Dict[str, int] = {}
+    for lease in dict(state.get("leases") or {}).values():
+        owner_id = str(lease.get("owner_id") or "")
+        if owner_id:
+            by_owner[owner_id] = by_owner.get(owner_id, 0) + 1
+    return by_owner
+
+
+def _reap_weighted_gate_state(state: Dict[str, Any], now: float) -> bool:
+    """Reclaim stale weighted leases and waiters in-place.
+
+    ``state == recovery`` is intentionally different from a normal stale
+    heartbeat: it represents a client timeout after a possible remote MinerU
+    task was submitted. Keep its capacity through ``recovery_until`` even when
+    the originating worker is gone, preventing a timeout from immediately
+    overselling a still-running remote task.
+    """
+    changed = False
+    leases: Dict[str, Any] = state["leases"]
+    waiters: Dict[str, Any] = state["waiters"]
+    recovered_count = int(state.get("recovered_count") or 0)
+    reclaimed_pids: set[int] = set()
+    alive_cache: Dict[int, bool] = {}
+
+    def _alive(pid: int) -> bool:
+        cached = alive_cache.get(pid)
+        if cached is None:
+            cached = _pid_alive(pid)
+            alive_cache[pid] = cached
+        return cached
+
+    for lease_id in list(leases.keys()):
+        lease = leases[lease_id]
+        recovery_until = lease.get("recovery_until")
+        if lease.get("state") == "recovery" and recovery_until is not None:
+            try:
+                is_recovery_active = now < float(recovery_until)
+            except (TypeError, ValueError):
+                is_recovery_active = False
+            if is_recovery_active:
+                continue
+            leases.pop(lease_id)
+            recovered_count += 1
+            changed = True
+            continue
+
+        pid = lease.get("pid")
+        updated_at = lease.get("updated_at", 0.0)
+        if not isinstance(pid, int) or not _alive(pid):
+            leases.pop(lease_id)
+            recovered_count += 1
+            changed = True
+            if isinstance(pid, int):
+                reclaimed_pids.add(pid)
+            continue
+        try:
+            heartbeat_expired = now - float(updated_at) > _heartbeat_ttl
+        except (TypeError, ValueError):
+            heartbeat_expired = True
+        if heartbeat_expired:
+            suspect_since = lease.get("suspect_since")
+            if suspect_since is None:
+                lease["suspect_since"] = now
+                changed = True
+            else:
+                try:
+                    suspect_expired = now - float(suspect_since) > _suspect_grace
+                except (TypeError, ValueError):
+                    suspect_expired = True
+                if suspect_expired:
+                    leases.pop(lease_id)
+                    recovered_count += 1
+                    reclaimed_pids.add(pid)
+                    changed = True
+        elif "suspect_since" in lease:
+            lease.pop("suspect_since", None)
+            changed = True
+
+    for waiter_id in list(waiters.keys()):
+        waiter = waiters[waiter_id]
+        pid = waiter.get("pid")
+        last_poll = waiter.get("last_poll", 0.0)
+        try:
+            stale = now - float(last_poll) > _waiter_stale_ttl
+        except (TypeError, ValueError):
+            stale = True
+        if (
+            not isinstance(pid, int)
+            or pid in reclaimed_pids
+            or not _alive(pid)
+            or stale
+        ):
+            waiters.pop(waiter_id)
+            changed = True
+
+    if state.get("recovered_count") != recovered_count:
+        state["recovered_count"] = recovered_count
+        changed = True
+    return changed
+
+
+def _weighted_waiter_is_eligible(
+    waiter: Mapping[str, Any],
+    *,
+    global_used: int,
+    kb_used: Mapping[str, int],
+    owner_request_counts: Mapping[str, int],
+    global_capacity: int,
+    per_kb_capacity: int,
+) -> bool:
+    weight = _weighted_lease_weight(waiter)
+    if weight <= 0 or weight > global_capacity or weight > per_kb_capacity:
+        return False
+    kb_key = str(waiter.get("kb_key") or "")
+    owner_id = str(waiter.get("owner_id") or "")
+    owner_request_limit = waiter.get("owner_request_limit")
+    if (
+        owner_id
+        and isinstance(owner_request_limit, int)
+        and not isinstance(owner_request_limit, bool)
+    ):
+        if (
+            owner_request_limit <= 0
+            or owner_request_counts.get(owner_id, 0) >= owner_request_limit
+        ):
+            return False
+    return (
+        global_used + weight <= global_capacity
+        and kb_used.get(kb_key, 0) + weight <= per_kb_capacity
+    )
+
+
+async def try_acquire_weighted_lease(
+    group: str,
+    *,
+    kb_key: str,
+    weight: int,
+    global_capacity: int,
+    per_kb_capacity: int,
+    waiter_id: str,
+    owner_id: str = "",
+    owner_request_limit: int | None = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+    aging_seconds: float = DEFAULT_WEIGHTED_LEASE_AGING_SECONDS,
+) -> tuple[Optional[Dict[str, Any]], bool]:
+    """Atomically acquire a weighted, per-KB lease.
+
+    Returns ``(admission, priority_waiter)``. ``admission`` is ``None`` when
+    capacity is unavailable or the waiting task has yielded to an aged eligible
+    task; callers should stay queued and retry. Shared-storage failures are
+    fail-closed and also return ``None``.
+    """
+    if not group:
+        raise ValueError("weighted lease group is required")
+    if not kb_key:
+        raise ValueError("weighted lease kb_key is required")
+    if not waiter_id:
+        raise ValueError("weighted lease waiter_id is required")
+    normalized_owner_id = str(owner_id or "").strip()
+    if owner_request_limit is not None:
+        if (
+            isinstance(owner_request_limit, bool)
+            or not isinstance(owner_request_limit, int)
+            or owner_request_limit <= 0
+        ):
+            raise ValueError(
+                "weighted lease owner_request_limit must be a positive integer"
+            )
+        if not normalized_owner_id:
+            raise ValueError(
+                "weighted lease owner_id is required with owner_request_limit"
+            )
+    if (
+        isinstance(weight, bool)
+        or not isinstance(weight, int)
+        or isinstance(global_capacity, bool)
+        or not isinstance(global_capacity, int)
+        or isinstance(per_kb_capacity, bool)
+        or not isinstance(per_kb_capacity, int)
+        or weight <= 0
+        or global_capacity <= 0
+        or per_kb_capacity <= 0
+    ):
+        raise ValueError("weighted lease capacity and weight must be positive integers")
+    if weight > global_capacity or weight > per_kb_capacity:
+        raise ValueError("weighted lease weight exceeds configured capacity")
+
+    try:
+        ns = await _get_lease_namespace()
+        async with get_storage_keyed_lock(
+            group, namespace=_CONCURRENCY_LEASE_NAMESPACE, enable_logging=False
+        ):
+            now = time.time()
+            state = _load_weighted_gate_state(ns, group)
+            _reap_weighted_gate_state(state, now)
+            waiters: Dict[str, Any] = state["waiters"]
+            current_waiter = waiters.get(waiter_id) or {
+                "pid": os.getpid(),
+                "wait_start": now,
+            }
+            current_waiter.update(
+                {
+                    "pid": os.getpid(),
+                    "last_poll": now,
+                    "weight": int(weight),
+                    "kb_key": str(kb_key),
+                }
+            )
+            if normalized_owner_id:
+                current_waiter["owner_id"] = normalized_owner_id
+                if owner_request_limit is not None:
+                    current_waiter["owner_request_limit"] = owner_request_limit
+                else:
+                    current_waiter.pop("owner_request_limit", None)
+            else:
+                current_waiter.pop("owner_id", None)
+                current_waiter.pop("owner_request_limit", None)
+            waiters[waiter_id] = current_waiter
+
+            global_used, kb_used = _weighted_usage(state)
+            owner_request_counts = _weighted_owner_request_counts(state)
+            eligible_waiters = [
+                (candidate_id, candidate)
+                for candidate_id, candidate in waiters.items()
+                if _weighted_waiter_is_eligible(
+                    candidate,
+                    global_used=global_used,
+                    kb_used=kb_used,
+                    owner_request_counts=owner_request_counts,
+                    global_capacity=int(global_capacity),
+                    per_kb_capacity=int(per_kb_capacity),
+                )
+            ]
+            eligible_waiters.sort(
+                key=lambda item: (
+                    float(item[1].get("wait_start", now)),
+                    item[0],
+                )
+            )
+            priority_waiter = (
+                bool(eligible_waiters) and eligible_waiters[0][0] == waiter_id
+            )
+            current_is_eligible = any(
+                candidate_id == waiter_id for candidate_id, _ in eligible_waiters
+            )
+
+            if not current_is_eligible:
+                ns[group] = state
+                return None, priority_waiter
+
+            if not priority_waiter and eligible_waiters:
+                oldest_waiter = eligible_waiters[0][1]
+                try:
+                    oldest_wait = now - float(oldest_waiter.get("wait_start", now))
+                except (TypeError, ValueError):
+                    oldest_wait = 0.0
+                # Small documents may briefly bypass a blocked large one to
+                # use otherwise idle capacity. Once the oldest executable
+                # waiter has aged, reserve the next admission for it.
+                if oldest_wait >= max(0.0, float(aging_seconds)):
+                    ns[group] = state
+                    return None, False
+
+            lease_id = uuid.uuid4().hex
+            lease: Dict[str, Any] = {
+                "pid": os.getpid(),
+                "updated_at": now,
+                "acquired_at": now,
+                "weight": int(weight),
+                "kb_key": str(kb_key),
+                "state": "active",
+            }
+            if normalized_owner_id:
+                lease["owner_id"] = normalized_owner_id
+                if owner_request_limit is not None:
+                    lease["owner_request_limit"] = owner_request_limit
+            if metadata:
+                for key, value in metadata.items():
+                    if value is None or isinstance(value, (str, int, float, bool)):
+                        lease[str(key)] = value
+            state["leases"][lease_id] = lease
+            wait_start = current_waiter.get("wait_start", now)
+            waiters.pop(waiter_id, None)
+            ns[group] = state
+            kb_after = kb_used.get(str(kb_key), 0) + int(weight)
+            owner_after = owner_request_counts.get(normalized_owner_id, 0) + 1
+            admission = {
+                "lease_id": lease_id,
+                "queue_wait_seconds": max(0.0, now - float(wait_start)),
+                "global_used_capacity": global_used + int(weight),
+                "kb_used_capacity": kb_after,
+                "global_capacity": int(global_capacity),
+                "per_kb_capacity": int(per_kb_capacity),
+            }
+            if normalized_owner_id:
+                admission["owner_active_requests"] = owner_after
+                admission["owner_request_limit"] = owner_request_limit
+            return (
+                admission,
+                True,
+            )
+    except Exception as error:
+        _log_acquire_failure(group, error)
+        return None, False
+
+
+async def clear_weighted_lease_waiter(group: str, waiter_id: str) -> None:
+    """Drop a queued weighted waiter record (idempotent)."""
+    if not _initialized or not group or not waiter_id:
+        return
+    ns = await _get_lease_namespace()
+    async with get_storage_keyed_lock(
+        group, namespace=_CONCURRENCY_LEASE_NAMESPACE, enable_logging=False
+    ):
+        state = _load_weighted_gate_state(ns, group)
+        if state["waiters"].pop(waiter_id, None) is not None:
+            ns[group] = state
+
+
+async def renew_weighted_lease(group: str, lease_id: str) -> bool:
+    """Refresh an active weighted lease heartbeat without resurrecting it."""
+    if not group or not lease_id:
+        return False
+    ns = await _get_lease_namespace()
+    async with get_storage_keyed_lock(
+        group, namespace=_CONCURRENCY_LEASE_NAMESPACE, enable_logging=False
+    ):
+        state = _load_weighted_gate_state(ns, group)
+        lease = state["leases"].get(lease_id)
+        if not lease or lease.get("state") == "recovery":
+            return False
+        lease["pid"] = os.getpid()
+        lease["updated_at"] = time.time()
+        lease.pop("suspect_since", None)
+        ns[group] = state
+        return True
+
+
+async def record_weighted_lease_remote_task(
+    group: str, lease_id: str, remote_task_id: str
+) -> bool:
+    """Persist a MinerU task id on an existing weighted lease.
+
+    A client may receive the remote id long before its polling loop completes.
+    Storing it atomically at that point makes timeout recovery actionable even
+    when the originating runtime worker exits before it can log a final result.
+    """
+    if not group or not lease_id or not remote_task_id:
+        return False
+    ns = await _get_lease_namespace()
+    async with get_storage_keyed_lock(
+        group, namespace=_CONCURRENCY_LEASE_NAMESPACE, enable_logging=False
+    ):
+        state = _load_weighted_gate_state(ns, group)
+        lease = state["leases"].get(lease_id)
+        if lease is None:
+            return False
+        lease["remote_task_id"] = str(remote_task_id)
+        lease["updated_at"] = time.time()
+        lease.pop("suspect_since", None)
+        ns[group] = state
+        return True
+
+
+async def release_weighted_lease(group: str, lease_id: str) -> bool:
+    """Release a weighted lease once; duplicate release is harmless."""
+    if not group or not lease_id:
+        return False
+    ns = await _get_lease_namespace()
+    async with get_storage_keyed_lock(
+        group, namespace=_CONCURRENCY_LEASE_NAMESPACE, enable_logging=False
+    ):
+        state = _load_weighted_gate_state(ns, group)
+        if state["leases"].pop(lease_id, None) is None:
+            return False
+        ns[group] = state
+        return True
+
+
+async def mark_weighted_lease_recovery(
+    group: str,
+    lease_id: str,
+    *,
+    recovery_seconds: float,
+    remote_task_id: str = "",
+    timeout_kind: str = "read",
+) -> bool:
+    """Keep a timed-out lease until a controlled recovery deadline.
+
+    This protects the global capacity ledger when the client timed out but the
+    remote MinerU task may still be executing. The reaper releases it only
+    after ``recovery_until`` and counts that release as a recovery event.
+    """
+    if not group or not lease_id:
+        return False
+    ns = await _get_lease_namespace()
+    async with get_storage_keyed_lock(
+        group, namespace=_CONCURRENCY_LEASE_NAMESPACE, enable_logging=False
+    ):
+        state = _load_weighted_gate_state(ns, group)
+        lease = state["leases"].get(lease_id)
+        if lease is None:
+            return False
+        now = time.time()
+        lease["state"] = "recovery"
+        lease["updated_at"] = now
+        lease["recovery_until"] = now + max(1.0, float(recovery_seconds))
+        lease["timeout_kind"] = str(timeout_kind or "read")
+        if remote_task_id:
+            lease["remote_task_id"] = str(remote_task_id)
+        lease.pop("suspect_since", None)
+        ns[group] = state
+        return True
+
+
+async def weighted_lease_snapshot(group: str) -> Dict[str, Any]:
+    """Return a bounded observability snapshot for a weighted lease group."""
+    if not _initialized or not group:
+        return {
+            "global_used_capacity": 0,
+            "by_kb": {},
+            "active_leases": 0,
+            "recovery_leases": 0,
+            "waiters": 0,
+            "recovered_count": 0,
+        }
+    ns = await _get_lease_namespace()
+    async with get_storage_keyed_lock(
+        group, namespace=_CONCURRENCY_LEASE_NAMESPACE, enable_logging=False
+    ):
+        now = time.time()
+        state = _load_weighted_gate_state(ns, group)
+        if _reap_weighted_gate_state(state, now):
+            ns[group] = state
+        global_used, by_kb = _weighted_usage(state)
+        recovery_leases = sum(
+            1 for lease in state["leases"].values() if lease.get("state") == "recovery"
+        )
+        waiters = [
+            {
+                "kb_key": str(waiter.get("kb_key") or ""),
+                "weight": _weighted_lease_weight(waiter),
+                "waited_seconds": max(0.0, now - float(waiter.get("wait_start", now))),
+            }
+            for waiter in state["waiters"].values()
+        ]
+        waiters.sort(key=lambda item: -item["waited_seconds"])
+        return {
+            "global_used_capacity": global_used,
+            "by_kb": by_kb,
+            "active_leases": len(state["leases"]),
+            "recovery_leases": recovery_leases,
+            "waiters": len(waiters),
+            "oldest_wait_seconds": waiters[0]["waited_seconds"] if waiters else 0.0,
+            "recovered_count": int(state.get("recovered_count") or 0),
+        }
+
+
+async def weighted_lease_exists_for_document(
+    group: str, *, kb_key: str, doc_id: str
+) -> bool:
+    """Return whether a live weighted lease owns one workspace document.
+
+    This is intentionally a narrow recovery guard, rather than a public lease
+    listing API. Both active and timeout-recovery leases count as live: a
+    recovery lease can still represent a remote MinerU task whose final state
+    is unknown, so callers must not retire and re-upload that document.
+    """
+    if not _initialized or not group or not kb_key or not doc_id:
+        return False
+    ns = await _get_lease_namespace()
+    async with get_storage_keyed_lock(
+        group, namespace=_CONCURRENCY_LEASE_NAMESPACE, enable_logging=False
+    ):
+        state = _load_weighted_gate_state(ns, group)
+        if _reap_weighted_gate_state(state, time.time()):
+            ns[group] = state
+        return any(
+            str(lease.get("kb_key") or "") == str(kb_key)
+            and str(lease.get("doc_id") or "") == str(doc_id)
+            for lease in state["leases"].values()
+        )
 
 
 # ---------------------------------------------------------------------------
