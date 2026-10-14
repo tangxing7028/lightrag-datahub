@@ -67,6 +67,57 @@ async def test_legacy_parse_txt_persists_and_archives(tmp_path, archived):
     assert "parse_stage_skipped" not in result.to_dict()
 
 
+@pytest.mark.parametrize("bom", [b"", b"\xef\xbb\xbf"])
+async def test_markdown_preserves_original_text_without_parsing(
+    tmp_path, archived, monkeypatch, bom
+):
+    body = (
+        "# \u77e5\u8bc6\u5e93\n\n"
+        "| Item | Value |\n| --- | --- |\n| Sample | 42 |\n\n"
+        "```python\nprint('kept')\n```\n\n"
+        "![external image](https://example.invalid/image.png)\n\n"
+        "$$x^2 + y^2 = z^2$$\n"
+    )
+
+    async def unexpected_parse(*args, **kwargs):
+        raise AssertionError("Markdown must not invoke a structural or remote parser")
+
+    monkeypatch.setattr(
+        "lightrag.parser.native_dispatch.NativeParser.parse", unexpected_parse
+    )
+    monkeypatch.setattr(
+        "lightrag.parser.external.mineru.parser.MinerUParser.parse", unexpected_parse
+    )
+    monkeypatch.setattr(
+        "lightrag.parser.external.docling.parser.DoclingParser.parse", unexpected_parse
+    )
+    source = tmp_path / "notes.MD"
+    source.write_bytes(bom + body.encode("utf-8"))
+    rag = _FakeRag()
+
+    result = await LegacyParser().parse(_ctx(rag, source))
+
+    assert result.content == body
+    assert rag.persisted[0][1]["content"] == body
+    assert result.parse_format == FULL_DOCS_FORMAT_RAW
+    assert result.parse_engine == "legacy"
+    assert result.to_dict()["parse_stage_skipped"] is True
+    assert archived == [str(source)]
+
+
+@pytest.mark.parametrize("content", [b"\xef\xbb\xbf", b"\xef\xbb\xbf\n \t", b"\xff"])
+async def test_markdown_rejects_empty_or_invalid_utf8(tmp_path, archived, content):
+    source = tmp_path / "invalid.md"
+    source.write_bytes(content)
+    rag = _FakeRag()
+
+    with pytest.raises(LegacyExtractionError):
+        await LegacyParser().parse(_ctx(rag, source))
+
+    assert rag.persisted == []
+    assert archived == []
+
+
 async def test_legacy_parse_unsupported_suffix_raises(tmp_path, archived):
     source = tmp_path / "image.xyz"
     source.write_bytes(b"not parseable")
