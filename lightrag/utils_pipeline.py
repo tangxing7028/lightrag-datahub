@@ -313,7 +313,8 @@ def read_source_file_basename(data: Any) -> str | None:
 # attempted but bailed".
 # ``parse_stage_skipped`` is written by ``parse_mineru`` / ``parse_docling``
 # when the raw bundle cache is valid and the parse stage round trip is
-# skipped; absence == not skipped (e.g. native parser, or cache miss).
+# skipped, or by ``LegacyParser`` for a direct Markdown text read. Absence
+# means parsing was not skipped (e.g. native parser, or cache miss).
 # ``analyzing_stage_skipped`` is its analyze-stage counterpart, written by
 # ``analyze_multimodal``'s three user/config early-return branches (no
 # blocks_path, blocks file missing, or user opted out of every i/t/e

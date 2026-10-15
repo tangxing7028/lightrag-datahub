@@ -382,6 +382,11 @@ def _upload_filename_with_directives(
     if not suffix:
         raise HTTPException(status_code=400, detail="上传文件缺少可识别的扩展名")
 
+    # Markdown is already text. Avoid structural parsing, image downloads and
+    # external parser calls while retaining the KB's processing directives.
+    if suffix.lower() == ".md":
+        engine = "legacy"
+
     # A knowledge-base parser is a default contract, not a guarantee that the
     # selected external engine accepts every file type the UI can upload. For
     # example, MinerU handles PDF and images but not Markdown. Preserve the
