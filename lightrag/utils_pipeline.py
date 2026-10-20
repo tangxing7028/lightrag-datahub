@@ -732,8 +732,9 @@ def doc_status_parse_failure_fields(
     if not current_summary or current_summary.startswith(
         FILE_EXTRACTION_SUMMARY_PREFIX
     ):
-        extra_fields["content_summary"] = (
-            FILE_EXTRACTION_SUMMARY_PREFIX + get_content_summary(error_text)
+        # PostgreSQL limits content_summary to 255 characters, including the prefix.
+        extra_fields["content_summary"] = get_content_summary(
+            FILE_EXTRACTION_SUMMARY_PREFIX + error_text.strip()
         )
     metadata_extra: dict[str, Any] = {
         "error_type": "file_extraction_error",

@@ -119,16 +119,20 @@ def test_engine_hint_does_not_override_existing_parse_engine():
     assert "parse_engine" not in meta
 
 
-def test_long_error_text_is_truncated_in_summary():
-    long_error = "x" * 1000
+@pytest.mark.parametrize("length", [232, 233, 234, 237, 238, 239, 250, 251, 1000])
+@pytest.mark.parametrize("character", ["x", "错", "🧾"])
+def test_long_error_text_is_truncated_in_summary(length, character):
+    long_error = character * length
     extra, _meta = doc_status_parse_failure_fields(
         ValueError(long_error), status_doc={"content_summary": "", "metadata": {}}
     )
     summary = extra["content_summary"]
     assert summary.startswith("[File Extraction]")
-    # get_content_summary caps the description at 250 chars (plus ellipsis).
-    assert len(summary) <= len("[File Extraction]") + 253
-    # error_msg keeps the full text.
+    assert len(summary) <= 255
+    if length + len("[File Extraction]") <= 250:
+        assert summary == "[File Extraction]" + long_error
+    else:
+        assert summary.endswith("...")
     assert extra["error_msg"] == long_error
 
 
@@ -237,7 +241,10 @@ async def test_legacy_parse_failure_maps_ui_fields_and_retry_clears_them(
 
 
 @pytest.mark.asyncio
-async def test_third_party_engine_failure_records_engine_name(tmp_path, monkeypatch):
+@pytest.mark.parametrize("error_text", ["boom engine exploded", "解析服务错误" * 100])
+async def test_third_party_engine_failure_records_engine_name(
+    tmp_path, monkeypatch, error_text
+):
     """Any registered engine whose parse() raises gets the same field mapping,
     with metadata.parse_engine attributing the failing engine."""
     input_dir = tmp_path / "input"
@@ -248,7 +255,7 @@ async def test_third_party_engine_failure_records_engine_name(tmp_path, monkeypa
         engine_name = "boomengine"
 
         async def parse(self, ctx):
-            raise RuntimeError("boom engine exploded")
+            raise RuntimeError(error_text)
 
     fake_mod = types.ModuleType("_test_boom_parser_mod")
     fake_mod.BoomParser = _BoomParser
@@ -272,13 +279,26 @@ async def test_third_party_engine_failure_records_engine_name(tmp_path, monkeypa
             parse_engine="boomengine",
         )
         doc_id = compute_mdhash_id("doc.txt", prefix="doc-")
+        original_upsert = rag.doc_status.upsert
 
+        async def _bounded_summary_upsert(data):
+            for row in data.values():
+                if len(row.get("content_summary", "")) > 255:
+                    raise ValueError("value too long for type character varying(255)")
+            await original_upsert(data)
+
+        monkeypatch.setattr(rag.doc_status, "upsert", _bounded_summary_upsert)
         await rag.apipeline_process_enqueue_documents()
 
         status = await rag.doc_status.get_by_id(doc_id)
         assert status["status"] == DocStatus.FAILED
-        assert status["error_msg"] == "boom engine exploded"
-        assert status["content_summary"] == "[File Extraction]boom engine exploded"
+        assert status["error_msg"] == error_text
+        assert status["content_summary"].startswith("[File Extraction]")
+        assert len(status["content_summary"]) <= 255
+        if len(error_text) < 200:
+            assert status["content_summary"] == "[File Extraction]" + error_text
+        else:
+            assert status["content_summary"].endswith("...")
         metadata = status["metadata"]
         assert metadata["error_type"] == "file_extraction_error"
         assert metadata["error_stage"] == "parse"
